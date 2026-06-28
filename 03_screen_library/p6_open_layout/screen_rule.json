@@ -1,0 +1,21 @@
+{
+  "screen_name": "p6_open_layout_dialog",
+  "recognition_text": [
+    "Open Layout",
+    "Layout",
+    "Available To",
+    "User",
+    "Project",
+    "Global",
+    "Open",
+    "Close",
+    "Import",
+    "Export"
+  ],
+  "crop_region_percent": {
+    "left": 0.12,
+    "top": 0.08,
+    "right": 0.88,
+    "bottom": 0.92
+  }
+}

@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Logs and run outputs
+06_output/
+logs/
+*.log
+
+# Screenshots / OCR / evidence
+screenshots/
+ocr/
+classification/
+popup/
+discovery/
+diagnostic/
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tif
+*.tiff
+
+# Exported files
+*.xlsx
+*.xls
+*.csv
+*.pdf
+*.xer
+*.xml
+
+# Secrets / config
+.env
+*.env
+secrets/
+credentials/
+tokens/
+*.token
+*.key
+*.pem
+client_secret*.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

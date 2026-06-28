@@ -1,0 +1,51 @@
+{
+  "project_root": "C:\\TY_DEV2",
+  "p6_window_title_keyword": "Primavera",
+  "output_root": "C:\\TY_DEV2\\06_output",
+  "min_ocr_confidence": 0.5,
+  "pollution_keywords": [
+    "agent",
+    "ty_dev2",
+    "cursor",
+    "chatgpt",
+    "m03",
+    "task",
+    "orchestrator",
+    "do not build",
+    "copilot",
+    "claude",
+    "openai",
+    "composer"
+  ],
+  "desktop_pollution_keywords": [
+    "delete",
+    "confirm",
+    "warning"
+  ],
+  "p6_recognition_keywords": [
+    "primavera",
+    "project",
+    "activities",
+    "projects",
+    "eps",
+    "open project",
+    "project id",
+    "project name",
+    "professional",
+    "current project",
+    "no current project"
+  ],
+  "popup_button_keywords": [
+    "cancel",
+    "yes",
+    "no",
+    "ok",
+    "open",
+    "warning"
+  ],
+  "previous_run": {
+    "run_id": "20260625_183445",
+    "final_score": 14,
+    "ocr_pollution_cases": 6
+  }
+}

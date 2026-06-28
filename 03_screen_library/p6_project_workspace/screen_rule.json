@@ -1,0 +1,20 @@
+{
+  "screen_name": "p6_project_workspace",
+  "description": "P6 main window — observe whether a project workspace is active",
+  "recognition_text": [
+    "Activities",
+    "Projects",
+    "EPS",
+    "WBS",
+    "Current Project",
+    "No Current Project"
+  ],
+  "workspace_keywords": [
+    "activities",
+    "wbs",
+    "eps"
+  ],
+  "safety_rules": {
+    "minimum_ocr_confidence": 0.5
+  }
+}

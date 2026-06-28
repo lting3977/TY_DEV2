@@ -1,0 +1,20 @@
+{
+  "screen_name": "p6_open_project_dialog",
+  "description": "Primavera P6 Open Project pop-up window",
+  "recognition_text": [
+    "Open Project",
+    "Project ID",
+    "Project Name",
+    "Open",
+    "Cancel"
+  ],
+  "crop_region_percent": {
+    "left": 0.34,
+    "top": 0.28,
+    "right": 0.63,
+    "bottom": 0.68
+  },
+  "safety_rules": {
+    "minimum_ocr_confidence": 0.5
+  }
+}

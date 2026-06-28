@@ -535,7 +535,7 @@ TY_TEST_M20_DIAGNOSTIC.bat
 
 **Behaviour:** Activities export-type discovery only. Opens File > Export, selects Spreadsheet/XLSX, Next once to Export Type, OCR-clicks Activities, Next once more, classifies post-Activities screen (Projects-to-export, template, file/path, or generic partial), then safely cancels. Does not press Finish, select template, or create export files.
 
-**Status:** STABLE — simple test `20260628_124800`, hard test `20260628_152901` (6/6). Do not modify unless a later module exposes a real shared bug.
+**Status:** STABLE / FROZEN — simple test `20260628_124800`, hard test `20260628_232920` (6/6). Do not modify unless a later module exposes a real shared bug.
 
 **Hard test batch:**
 
@@ -550,6 +550,9 @@ TY_TEST_M20_HARD_6.bat
 - Next pressed exactly twice on discovery paths; wizard closed via Cancel.
 - No Finish pressed; no export files created; P6 returns to Activities after close.
 - M20 preflight clears stale Open Project and export wizard dialogs before File > Export.
+- Hard matrix uses `ensure_clean_p6_for_m20_hard()` before each test; test 06 probes export wizard open before applying late hook.
+- Test 06 hook `force_post_activities_screen_not_found_after_second_next` activates only after Spreadsheet → first Next → Export Type → Activities → second Next.
+- Export wizard open retry (max 1) on File > Export failure; setup failures scored separately from module FALSE_PASS.
 - Shared helpers in `export_wizard_common.py` (M20+ only; M03–M19 frozen).
 
 ## Safety (all modules)

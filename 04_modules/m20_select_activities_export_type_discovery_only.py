@@ -400,6 +400,7 @@ def run_m20(
     ui_wait_sec: int = 8,
     force_activities_export_type_not_found: bool = False,
     force_post_activities_next_screen_not_found: bool = False,
+    force_post_activities_screen_not_found_after_second_next: bool = False,
 ) -> Dict[str, Any]:
     if diagnostic:
         return run_m20_diagnostic(
@@ -430,8 +431,10 @@ def run_m20(
 
     if force_activities_export_type_not_found:
         evidence.steps.append("Hook: force_activities_export_type_not_found")
-    if force_post_activities_next_screen_not_found:
-        evidence.steps.append("Hook: force_post_activities_next_screen_not_found")
+    if force_post_activities_screen_not_found_after_second_next:
+        evidence.steps.append("Hook: force_post_activities_screen_not_found_after_second_next (armed)")
+    elif force_post_activities_next_screen_not_found:
+        evidence.steps.append("Hook: force_post_activities_next_screen_not_found (legacy)")
 
     try:
         p6_rect, window_title_before, screen_state_before, preflight_meta, prep_err = (
@@ -444,8 +447,16 @@ def run_m20(
                 k: v for k, v in prep_err.items() if k not in ("status", "reason")
             }, **preflight_meta)
 
+        use_late_hook = force_post_activities_screen_not_found_after_second_next or force_post_activities_next_screen_not_found
         p6_rect, ctx, path_err = m20_controlled_wizard_to_post_activities(
-            evidence, p6_keyword, p6_rect, config, screen_rule, min_confidence, project_name
+            evidence,
+            p6_keyword,
+            p6_rect,
+            config,
+            screen_rule,
+            min_confidence,
+            project_name,
+            force_post_activities_screen_not_found_after_second_next=use_late_hook,
         )
         if path_err:
             err_fields = {
@@ -519,12 +530,6 @@ def run_m20(
         returned_to_activities = in_activities_after_next and post_type == "unknown"
 
         activities_selected = ctx.get("activities_selected", False) or bool(ctx.get("activities_click_text"))
-
-        if force_post_activities_next_screen_not_found:
-            post_ok = False
-            post_words = []
-            post_type = "unknown"
-            post_class_status = "FAIL_ACTIVITIES_NEXT_SCREEN_NOT_FOUND"
 
         save_discovery(
             evidence,
@@ -621,6 +626,8 @@ def run_m20(
             close_method_used=close_method,
             export_file_created=file_created,
             manual_review_required=status.startswith("MANUAL_REVIEW"),
+            forced_hook_activation=ctx.get("forced_hook_activation"),
+            export_open_attempt=ctx.get("export_open_attempt"),
             **{
                 k: v
                 for k, v in preflight_meta.items()
@@ -648,6 +655,7 @@ def main() -> None:
     parser.add_argument("--ui-wait-sec", type=int, default=8)
     parser.add_argument("--force-activities-export-type-not-found", action="store_true")
     parser.add_argument("--force-post-activities-next-screen-not-found", action="store_true")
+    parser.add_argument("--force-post-activities-screen-not-found-after-second-next", action="store_true")
     args = parser.parse_args()
     result = run_m20(
         args.project,
@@ -657,6 +665,10 @@ def main() -> None:
         ui_wait_sec=args.ui_wait_sec,
         force_activities_export_type_not_found=args.force_activities_export_type_not_found,
         force_post_activities_next_screen_not_found=args.force_post_activities_next_screen_not_found,
+        force_post_activities_screen_not_found_after_second_next=(
+            args.force_post_activities_screen_not_found_after_second_next
+            or args.force_post_activities_next_screen_not_found
+        ),
     )
     print(json.dumps(result, indent=2))
     sys.exit(0 if result["status"] in PASS_STATUSES else 1)

@@ -365,6 +365,62 @@ def try_close_dialog_once(
     return "none"
 
 
+CLOSE_PROJECT_CONFIRM_MARKERS = (
+    "close this project",
+    "close project",
+    "want to close",
+    "cloze this project",
+    "cloze project",
+    "close the project",
+)
+
+
+def is_close_project_confirmation(blob: str) -> bool:
+    """Detect P6 close-project Yes/No prompt (tolerates OCR garble like cloze/8ure)."""
+    norm = normalize_text(blob)
+    if any(m in norm for m in CLOSE_PROJECT_CONFIRM_MARKERS):
+        return True
+    if "project" in norm and ("close" in norm or "cloze" in norm):
+        if any(w in norm for w in ("sure", "8ure", "want", "yo")):
+            return True
+    return False
+
+
+def find_yes_button_entry(
+    entries: List[Dict[str, Any]],
+    min_confidence: float,
+) -> Optional[Dict[str, Any]]:
+    for entry in entries:
+        if entry["confidence"] < min_confidence * 0.45:
+            continue
+        norm = entry.get("normalized", "").strip()
+        if norm in ("yes", "ves", "yas", "ye5") or norm.startswith("yes"):
+            return entry
+    return None
+
+
+def try_resolve_stale_close_project_popup(
+    evidence: ExportWizardEvidence,
+    p6_rect: P6Rect,
+    entries: List[Dict[str, Any]],
+    min_confidence: float,
+) -> Tuple[bool, str]:
+    """Complete or dismiss stale close-project Yes/No left by M05 hard-test setup."""
+    blob = collect_text_blob(entries, min_confidence)
+    if not is_close_project_confirmation(blob):
+        return False, ""
+    blocking, _ = detect_m16_blocking_popup(entries, min_confidence)
+    if not blocking:
+        return False, ""
+
+    import pyautogui
+
+    evidence.steps.append("M20: Alt+Y on stale close-project confirmation (M05-style)")
+    pyautogui.hotkey("alt", "y")
+    time.sleep(STABILITY_WAIT)
+    return True, "alt+y"
+
+
 def m20_hard_dismiss_stale_dialogs(
     p6_keyword: str,
     config: Dict[str, Any],
@@ -410,6 +466,20 @@ def m20_hard_dismiss_stale_dialogs(
         blob = collect_text_blob(entries, min_confidence)
         norm = normalize_text(blob)
         evidence_words = find_export_evidence_words(blob)
+
+        blocking, block_reason = detect_m16_blocking_popup(entries, min_confidence)
+        if blocking:
+            if is_close_project_confirmation(blob):
+                notes.append(
+                    f"hard prep attempt {attempt}: completing close-project confirmation ({block_reason})"
+                )
+                try_resolve_stale_close_project_popup(evidence, p6_rect, entries, min_confidence)
+            else:
+                notes.append(f"hard prep attempt {attempt}: dismissing blocking popup ({block_reason})")
+                keyboard_tools.press_escape()
+            time.sleep(0.8)
+            p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+            continue
 
         if open_project_dialog_detected(cap, min_confidence):
             notes.append(f"hard prep attempt {attempt}: dismissing Open Project dialog")
@@ -513,9 +583,32 @@ def find_export_type_anchor_ys(
             continue
         if norm == "export type" or "data to export" in norm:
             export_type_y = yc if export_type_y is None else min(export_type_y, yc)
-        if "activity relationships" in norm or norm == "relationships":
+        if "activity relationships" in norm or norm == "relationships" or "activity relationship" in norm:
             relationships_y = yc if relationships_y is None else min(relationships_y, yc)
     return export_type_y, relationships_y
+
+
+def score_activities_export_type_entry(norm: str) -> float:
+    """Score OCR row as Activities export-type list item (tolerates activitie? / ectivities)."""
+    if "activity relationships" in norm or ("relationships" in norm and "activit" not in norm):
+        return 0.0
+    if "resource" in norm or "expense" in norm:
+        return 0.0
+    if "filter:" in norm or "activity name" in norm or "new activity" in norm or norm == "activity":
+        return 0.0
+    if norm in ("ectivities",):
+        return 28.0
+    if norm in ("activities",):
+        return 24.0
+    if "ectivities" in norm:
+        return 22.0
+    if "activities" in norm:
+        return 18.0
+    if norm.startswith("activitie") or norm.startswith("allactivitie"):
+        return 20.0
+    if norm.startswith("activit") and "relationship" not in norm:
+        return 16.0
+    return 0.0
 
 
 def find_activities_export_type_entry(
@@ -531,7 +624,14 @@ def find_activities_export_type_entry(
     }
     has_neighbors = any(
         k in " ".join(neighbor_norms)
-        for k in ("activity relationships", "relationships", "resources", "expenses", "resource assignments")
+        for k in (
+            "activity relationships",
+            "activity relationship",
+            "relationships",
+            "resources",
+            "expenses",
+            "resource assignments",
+        )
     )
     best: Optional[Dict[str, Any]] = None
     best_score = 0.0
@@ -541,21 +641,7 @@ def find_activities_export_type_entry(
             continue
         norm = entry.get("normalized", "")
         raw = entry.get("text", "")
-        if "activity relationships" in norm or ("relationships" in norm and "activit" not in norm):
-            continue
-        if "resource" in norm or "expense" in norm:
-            continue
-        if "filter:" in norm or "activity name" in norm or "new activity" in norm or norm == "activity":
-            continue
-        score = 0.0
-        if norm in ("ectivities",):
-            score = 28.0
-        elif norm in ("activities",):
-            score = 24.0
-        elif "ectivities" in norm:
-            score = 22.0
-        elif "activities" in norm:
-            score = 18.0
+        score = score_activities_export_type_entry(norm)
         if score <= 0:
             continue
         ys = [p[1] for p in entry.get("bbox", [[0, 0]])]
@@ -910,11 +996,29 @@ def m20_preflight_reset_before_export(
     entries = cap["entries"]
 
     if cap.get("unsafe"):
-        return None, window_title, screen_state, preflight, {
-            "status": "MANUAL_REVIEW_UNSAFE_POPUP",
-            "reason": cap.get("unsafe_reason", "unsafe popup during preflight"),
-            "manual_review_required": True,
-        }
+        resolved, resolve_method = try_resolve_stale_close_project_popup(
+            evidence, p6_rect, entries, min_confidence
+        )
+        if resolved:
+            preflight["stale_close_confirm_resolved"] = resolve_method
+            time.sleep(1.0)
+            p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+            cap = capture_preflight("preflight_01b_after_close_confirm", p6_rect)
+            if not cap.get("ok"):
+                polluted = cap.get("polluted")
+                return None, window_title, screen_state, preflight, {
+                    "status": "MANUAL_REVIEW_CANNOT_CONFIRM" if polluted else "FAIL_P6_WINDOW_NOT_READY",
+                    "reason": cap.get("error", "preflight post close-confirm capture failed"),
+                    "manual_review_required": bool(polluted),
+                }
+            screen_state = cap["screen_state"]
+            entries = cap["entries"]
+        if cap.get("unsafe"):
+            return None, window_title, screen_state, preflight, {
+                "status": "MANUAL_REVIEW_UNSAFE_POPUP",
+                "reason": cap.get("unsafe_reason", "unsafe popup during preflight"),
+                "manual_review_required": True,
+            }
 
     if open_project_dialog_detected(cap, min_confidence):
         preflight["old_open_project_detected"] = True
@@ -1035,6 +1139,148 @@ def m20_preflight_reset_before_export(
     return p6_rect, window_title, screen_state, preflight, None
 
 
+def _wizard_open_from_capture(
+    cap: Dict[str, Any],
+    min_confidence: float,
+) -> Tuple[bool, str, List[str], List[Dict[str, Any]]]:
+    entries = cap.get("entries", [])
+    wizard_blob = collect_text_blob(entries, min_confidence)
+    evidence_words = find_export_evidence_words(wizard_blob)
+    wizard_detected = export_dialog_detected(evidence_words) or "export format" in normalize_text(wizard_blob)
+    return wizard_detected, wizard_blob, evidence_words, entries
+
+
+def m20_open_export_wizard_with_retry(
+    evidence: ExportWizardEvidence,
+    p6_keyword: str,
+    p6_rect: P6Rect,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+    *,
+    first_label: str = "03_after_wizard",
+    retry_label: str = "03_after_wizard_retry",
+) -> Tuple[P6Rect, Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Open File > Export with one safe retry when wizard not detected."""
+    pollution_acc: Dict[str, Any] = {
+        "pollution_detected": False,
+        "pollution_recovered": False,
+        "pollution_words": [],
+    }
+    open_export_menu(evidence)
+    p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+    after_wizard, p6_rect, pol, err = m20_step_capture(
+        evidence, first_label, p6_rect, p6_keyword, config, screen_rule, min_confidence
+    )
+    pollution_acc["pollution_detected"] = pollution_acc["pollution_detected"] or pol.get("pollution_detected", False)
+    pollution_acc["pollution_recovered"] = pollution_acc["pollution_recovered"] or pol.get("pollution_recovered", False)
+    if pol.get("pollution_words"):
+        pollution_acc["pollution_words"] = pol["pollution_words"]
+    if err:
+        return p6_rect, after_wizard, pollution_acc, err
+
+    wizard_detected, wizard_blob, evidence_words, entries = _wizard_open_from_capture(
+        after_wizard, min_confidence
+    )
+    attempt_meta = {
+        "attempt": 1,
+        "label": first_label,
+        "wizard_detected": wizard_detected,
+        "evidence_words": evidence_words,
+        "ocr_excerpt": wizard_blob[:500],
+    }
+
+    if not wizard_detected:
+        safe_esc = True
+        if after_wizard.get("ok"):
+            blob = collect_text_blob(entries, min_confidence)
+            blocking, block_reason = detect_m16_blocking_popup(entries, min_confidence)
+            if blocking and not is_close_project_confirmation(blob):
+                safe_esc = False
+                attempt_meta["retry_blocked"] = block_reason
+            elif is_close_project_confirmation(blob):
+                safe_esc = False
+                attempt_meta["retry_blocked"] = "close_project_confirmation_visible"
+        if safe_esc:
+            evidence.steps.append("M20: export wizard not detected — Esc once, refocus P6, retry Alt+F,E")
+            keyboard_tools.press_escape()
+            time.sleep(0.6)
+        window_tools.activate_window_by_title(p6_keyword)
+        time.sleep(0.5)
+        p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+        nav_cap = capture_and_ocr_step(evidence, "03_retry_activities_check", p6_rect, config, screen_rule)
+        if nav_cap.get("ok"):
+            in_act, _ = confirms_activities_workspace(nav_cap["entries"], min_confidence)
+            if not in_act:
+                navigate_to_activities(evidence)
+                p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+        open_export_menu(evidence)
+        p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+        after_retry, p6_rect, pol2, err2 = m20_step_capture(
+            evidence, retry_label, p6_rect, p6_keyword, config, screen_rule, min_confidence
+        )
+        pollution_acc["pollution_detected"] = pollution_acc["pollution_detected"] or pol2.get("pollution_detected", False)
+        pollution_acc["pollution_recovered"] = pollution_acc["pollution_recovered"] or pol2.get("pollution_recovered", False)
+        if pol2.get("pollution_words"):
+            pollution_acc["pollution_words"] = pol2["pollution_words"]
+        if err2:
+            return p6_rect, after_wizard, pollution_acc, err2
+        wizard_detected, wizard_blob, evidence_words, entries = _wizard_open_from_capture(
+            after_retry, min_confidence
+        )
+        after_wizard = after_retry
+        attempt_meta = {
+            "attempt": 2,
+            "label": retry_label,
+            "wizard_detected": wizard_detected,
+            "evidence_words": evidence_words,
+            "ocr_excerpt": wizard_blob[:500],
+        }
+
+    after_wizard["wizard_detected"] = wizard_detected
+    after_wizard["wizard_blob"] = wizard_blob
+    after_wizard["evidence_words"] = evidence_words
+    after_wizard["export_open_attempt"] = attempt_meta
+    return p6_rect, after_wizard, pollution_acc, None
+
+
+def probe_export_wizard_open(
+    evidence: ExportWizardEvidence,
+    p6_keyword: str,
+    p6_rect: P6Rect,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+    *,
+    label: str = "probe_after_wizard",
+) -> Tuple[P6Rect, Dict[str, Any]]:
+    """Open export wizard once for hard-test precheck; returns probe payload (caller closes wizard)."""
+    p6_rect, cap, pol, err = m20_open_export_wizard_with_retry(
+        evidence,
+        p6_keyword,
+        p6_rect,
+        config,
+        screen_rule,
+        min_confidence,
+        first_label=label,
+        retry_label=f"{label}_retry",
+    )
+    wizard_detected = bool(cap.get("wizard_detected"))
+    payload: Dict[str, Any] = {
+        "wizard_opened": wizard_detected,
+        "evidence_words": cap.get("evidence_words", []),
+        "ocr_excerpt": (cap.get("wizard_blob") or "")[:500],
+        "export_open_attempt": cap.get("export_open_attempt", {}),
+        "pollution": pol,
+        "capture_error": err,
+        "screen_state": cap.get("screen_state", "unknown"),
+    }
+    if err:
+        payload["wizard_opened"] = False
+        payload["error"] = err
+    return p6_rect, payload
+
+
 def m20_controlled_wizard_to_post_activities(
     evidence: ExportWizardEvidence,
     p6_keyword: str,
@@ -1043,6 +1289,8 @@ def m20_controlled_wizard_to_post_activities(
     screen_rule: Dict[str, Any],
     min_confidence: float,
     project_name: str = "",
+    *,
+    force_post_activities_screen_not_found_after_second_next: bool = False,
 ) -> Tuple[P6Rect, Dict[str, Any], Optional[Dict[str, Any]]]:
     """M20 controlled export wizard path with step pollution gates and discovery evidence."""
     ctx: Dict[str, Any] = {
@@ -1055,10 +1303,8 @@ def m20_controlled_wizard_to_post_activities(
         "wizard_closed_unexpectedly": False,
     }
 
-    open_export_menu(evidence)
-    p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
-    after_wizard, p6_rect, pol, err = m20_step_capture(
-        evidence, "03_after_wizard", p6_rect, p6_keyword, config, screen_rule, min_confidence
+    p6_rect, after_wizard, pol, err = m20_open_export_wizard_with_retry(
+        evidence, p6_keyword, p6_rect, config, screen_rule, min_confidence
     )
     ctx["pollution_detected"] = ctx["pollution_detected"] or pol.get("pollution_detected", False)
     ctx["pollution_recovered"] = ctx["pollution_recovered"] or pol.get("pollution_recovered", False)
@@ -1067,9 +1313,11 @@ def m20_controlled_wizard_to_post_activities(
     if err:
         return p6_rect, ctx, err
 
-    wizard_blob = collect_text_blob(after_wizard["entries"], min_confidence)
-    evidence_words = find_export_evidence_words(wizard_blob)
-    wizard_detected = export_dialog_detected(evidence_words) or "export format" in normalize_text(wizard_blob)
+    wizard_detected = bool(after_wizard.get("wizard_detected"))
+    wizard_blob = after_wizard.get("wizard_blob", "")
+    evidence_words = after_wizard.get("evidence_words", [])
+    ctx["export_open_attempt"] = after_wizard.get("export_open_attempt", {})
+    save_discovery(evidence, "export_open_attempt.json", ctx["export_open_attempt"])
     spreadsheet_detected, spreadsheet_text = detect_spreadsheet_in_blob(wizard_blob)
     ss_entry, ss_click = find_spreadsheet_entry(after_wizard["entries"], min_confidence)
     if ss_entry is not None and not spreadsheet_detected:
@@ -1350,6 +1598,34 @@ def m20_controlled_wizard_to_post_activities(
     post_class = classify_post_activities_next_screen(
         after_post["entries"], min_confidence, project_name=project_name
     )
+
+    if force_post_activities_screen_not_found_after_second_next:
+        evidence.steps.append("Hook: force_post_activities_screen_not_found_after_second_next")
+        ctx["forced_hook_activation"] = {
+            "spreadsheet_selected": bool(ctx.get("spreadsheet_selected")),
+            "spreadsheet_detected": bool(ctx.get("spreadsheet_detected")),
+            "first_next_pressed": bool(ctx.get("first_next_clicked_by_ocr_bbox")),
+            "export_type_screen_detected": bool(ctx.get("export_type_screen_ok")),
+            "activities_selected": bool(ctx.get("activities_selected")),
+            "second_next_pressed": bool(ctx.get("second_next_clicked_by_ocr_bbox")),
+            "hook_applied_after_second_next": True,
+            "finish_pressed": finish_pressed_in_steps(evidence.steps),
+            "export_file_created": False,
+            "wizard_still_open_before_hook": post_class.get("wizard_still_open", True),
+            "original_post_screen_type": post_class.get("post_activities_screen_type", "unknown"),
+            "original_evidence_words": list(post_class.get("evidence_words", [])),
+        }
+        save_discovery(evidence, "forced_hook_activation.json", ctx["forced_hook_activation"])
+        post_class = {
+            "post_activities_screen_type": "unknown",
+            "evidence_words": [],
+            "raw_ocr_text": post_class.get("raw_ocr_text", "")[:4000],
+            "post_screen_ok": False,
+            "wizard_still_open": post_class.get("wizard_still_open", True),
+            "status": "FAIL_ACTIVITIES_NEXT_SCREEN_NOT_FOUND",
+            "reason": "Hook: force_post_activities_screen_not_found_after_second_next",
+        }
+
     ctx.update(
         {
             "post_activities_screen_type": post_class["post_activities_screen_type"],
@@ -1374,6 +1650,7 @@ def m20_controlled_wizard_to_post_activities(
             "finish_pressed": finish_pressed_in_steps(evidence.steps),
             "export_file_created": False,
             "wizard_still_open": post_class["wizard_still_open"],
+            "hook_applied": force_post_activities_screen_not_found_after_second_next,
         },
     )
     return p6_rect, ctx, None
@@ -2268,30 +2545,21 @@ def find_activities_export_type_candidates(
     }
     has_neighbors = any(
         k in " ".join(neighbor_norms)
-        for k in ("activity relationships", "relationships", "resources", "expenses", "resource assignments")
+        for k in (
+            "activity relationships",
+            "activity relationship",
+            "relationships",
+            "resources",
+            "expenses",
+            "resource assignments",
+        )
     )
     candidates: List[Dict[str, Any]] = []
     for entry in entries:
         if entry["confidence"] < min_confidence:
             continue
         norm = entry.get("normalized", "")
-        if "activity relationships" in norm or ("relationships" in norm and "activit" not in norm):
-            continue
-        if "resource" in norm or "expense" in norm:
-            continue
-        if "filter:" in norm or "activity name" in norm or "new activity" in norm:
-            continue
-        score = 0.0
-        if norm in ("ectivities",):
-            score = 28.0
-        elif norm in ("activities",):
-            score = 24.0
-        elif "ectivities" in norm:
-            score = 22.0
-        elif norm in ("activity",):
-            score = 12.0
-        elif "activities" in norm:
-            score = 18.0
+        score = score_activities_export_type_entry(norm)
         if score <= 0:
             continue
         ys = [p[1] for p in entry.get("bbox", [[0, 0]])]

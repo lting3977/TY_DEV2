@@ -23,6 +23,7 @@
 | M18 | `m18_select_spreadsheet_export_format_discovery_only.py` | **Frozen (STABLE)** | Spreadsheet export discovery — select XLSX, Next once, capture next screen |
 | M19 | `m19_discover_spreadsheet_export_type_options.py` | **Frozen (STABLE)** | Export Type discovery — OCR export type options after Spreadsheet Next |
 | M20 | `m20_select_activities_export_type_discovery_only.py` | **Frozen (STABLE)** | Activities export discovery — Spreadsheet, Activities, Next twice, post-Activities screen, cancel |
+| M21 | `m21_discover_activity_export_template_screen.py` | **Frozen (STABLE)** | Activity export template discovery — Projects-to-export, third Next, validation/template screen, cancel |
 
 ## Phase 2 — M03 (Frozen)
 
@@ -554,6 +555,47 @@ TY_TEST_M20_HARD_6.bat
 - Test 06 hook `force_post_activities_screen_not_found_after_second_next` activates only after Spreadsheet → first Next → Export Type → Activities → second Next.
 - Export wizard open retry (max 1) on File > Export failure; setup failures scored separately from module FALSE_PASS.
 - Shared helpers in `export_wizard_common.py` (M20+ only; M03–M19 frozen).
+
+## Phase 20 — M21
+
+**Command:**
+
+```bat
+python 04_modules\m21_discover_activity_export_template_screen.py --project "Talison 1275"
+```
+
+**Batch test:**
+
+```bat
+TY_TEST_M21_DISCOVER_ACTIVITY_TEMPLATE_SCREEN.bat
+TY_TEST_M21_HARD_6.bat
+```
+
+**Output:**
+
+`06_output\runs\<run_id>\m21_discover_activity_export_template_screen\`
+
+**Behaviour:** Activity export template discovery only. Spreadsheet → Export Type → Activities → Projects-to-export → third Next → classify post-Projects screen (template, validation popup, file/path, or partial), then safely cancel. Does not press Finish, select template, type path, or create export files.
+
+**Status:** STABLE / FROZEN — simple test `20260629_130413`, hard test `20260629_163456` (6/6). Do not modify unless a later module exposes a real shared bug.
+
+**Hard test batch:**
+
+```bat
+TY_TEST_M21_HARD_6.bat
+```
+
+**Notes:**
+
+- Valid PASS statuses: `PASS_TEMPLATE_SCREEN_DISCOVERY`, `PASS_TEMPLATE_SCREEN_DISCOVERY_PARTIAL`, `PASS_POST_PROJECTS_SCREEN_DISCOVERY`.
+- Validation popup after third Next (`projects_validation_popup`) is valid discovery; popup dismissed via OCR OK or Esc.
+- Next pressed exactly 3 times on discovery paths; wizard closed via Cancel.
+- No Finish pressed; no export files created; no Browse/path/template edit.
+- Hard matrix uses `ensure_clean_p6_for_m21_hard()` — self-restores Talison 1275 + Activities (M03/M04/M06 + Open Project fallback).
+- Test 04 closes project via M05; expects `FAIL_PROJECT_NOT_OPEN`; post-test restore before tests 05–06.
+- Test 05 hook `force_projects_export_blocked_after_third_next` activates only after full wizard path + third Next.
+- Test 06 hook `force_post_projects_next_screen_not_found_after_third_next` activates only after third Next with stage evidence.
+- Shared helpers in `export_wizard_common.py` (M21+ only; M03–M20 frozen).
 
 ## Safety (all modules)
 

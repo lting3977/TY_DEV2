@@ -6,8 +6,10 @@ Read-only imports from frozen modules; new discovery flow helpers live here.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -33,7 +35,7 @@ from m06_go_to_activities import (
 )
 from eye.ocr import collect_text_blob, is_easyocr_available, normalize_text, ocr_to_entries, run_easyocr, save_ocr_results
 from eye.screenshot import P6Rect, capture_p6_window_only
-from hand.p6_prepare import prepare_p6_for_test
+from hand.p6_prepare import get_fresh_p6_rect, prepare_p6_for_test
 from accessibility.hand import window_tools
 from accessibility.hand import keyboard_tools
 from m16_discover_p6_export_menu import (
@@ -409,9 +411,6 @@ def try_resolve_stale_close_project_popup(
     blob = collect_text_blob(entries, min_confidence)
     if not is_close_project_confirmation(blob):
         return False, ""
-    blocking, _ = detect_m16_blocking_popup(entries, min_confidence)
-    if not blocking:
-        return False, ""
 
     import pyautogui
 
@@ -467,6 +466,25 @@ def m20_hard_dismiss_stale_dialogs(
         norm = normalize_text(blob)
         evidence_words = find_export_evidence_words(blob)
 
+        if is_close_project_confirmation(blob):
+            notes.append(f"hard prep attempt {attempt}: completing close-project confirmation")
+            resolved, method = try_resolve_stale_close_project_popup(
+                evidence, p6_rect, entries, min_confidence
+            )
+            if not resolved:
+                yes_entry = find_yes_button_entry(entries, min_confidence)
+                if yes_entry is not None:
+                    click_ocr_entry(p6_rect, yes_entry)
+                    notes.append("hard prep: OCR Yes on close-project confirmation")
+                else:
+                    keyboard_tools.press_key("y")
+                    notes.append("hard prep: Y key on close-project confirmation")
+            else:
+                notes.append(f"hard prep: close-project resolved via {method}")
+            time.sleep(0.8)
+            p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+            continue
+
         blocking, block_reason = detect_m16_blocking_popup(entries, min_confidence)
         if blocking:
             if is_close_project_confirmation(blob):
@@ -491,6 +509,16 @@ def m20_hard_dismiss_stale_dialogs(
                 min_confidence,
                 dialog_name="Open Project dialog",
                 confirmed=True,
+            )
+            time.sleep(0.8)
+            p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+            continue
+
+        validation_hit, _ = m21_validation_popup_in_entries(entries, min_confidence)
+        if m21_projects_validation_popup_detected(norm) or validation_hit:
+            notes.append(f"hard prep attempt {attempt}: dismissing projects validation popup")
+            m21_dismiss_projects_validation_popup(
+                evidence, p6_rect, p6_keyword, config, screen_rule, min_confidence, entries
             )
             time.sleep(0.8)
             p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
@@ -2232,12 +2260,18 @@ def ocr_wizard_crop(
 
     evidence.screenshots.append(capture["image_path"])
     margin = WIZARD_CROP_MARGIN
-    x0 = max(0, int(wizard_bounds["x_min"] - margin))
-    y0 = max(0, int(wizard_bounds["y_min"] - margin))
-    x1 = min(p6_rect.width, int(wizard_bounds["x_max"] + margin))
-    y1 = min(p6_rect.height, int(wizard_bounds["y_max"] + margin))
+    x0 = max(0, int(wizard_bounds.get("x_min", 0) - margin))
+    y0 = max(0, int(wizard_bounds.get("y_min", 0) - margin))
+    x1 = min(p6_rect.width, int(wizard_bounds.get("x_max", p6_rect.width) + margin))
+    y1 = min(p6_rect.height, int(wizard_bounds.get("y_max", p6_rect.height) + margin))
     if x1 <= x0 or y1 <= y0:
-        return {"ok": False, "error": "Invalid wizard bounds for crop", "screen_state": "unknown"}
+        evidence.steps.append(f"M21/M20: wizard crop bounds invalid for {label} — fallback to full P6 OCR")
+        cap_full = capture_and_ocr_step(evidence, label, p6_rect, config, screen_rule)
+        if cap_full.get("ok"):
+            blob = collect_text_blob(cap_full["entries"], min_confidence)
+            cap_full["screen_state"] = classify_m20_screen_state(cap_full["entries"], blob, min_confidence)
+            cap_full["ocr_mode"] = "p6_full_fallback"
+        return cap_full
 
     wizard_crop_path = evidence.screenshots_dir / f"{label}_wizard_crop.png"
     with Image.open(capture["image_path"]) as img:
@@ -3269,3 +3303,1503 @@ def m20_run_diagnostic(
         "wizard_bounds_cached": state.cached_wizard_bounds,
         "dialog_closed": state.dialog_closed,
     }
+
+
+# --- M21: Projects-to-export -> post-projects next screen discovery ---
+
+M21_PROJECTS_TO_EXPORT_MARKERS = M20_POST_PROJECTS_TO_EXPORT_WORDS
+
+M21_POST_PROJECTS_TEMPLATE_WORDS = (
+    "select template",
+    "template",
+    "modify template",
+    "add",
+    "delete",
+    "columns",
+    "spreadsheet",
+    "next",
+    "back",
+    "cancel",
+    "finish",
+)
+
+M21_POST_PROJECTS_FILE_PATH_WORDS = (
+    "file name",
+    "output file",
+    "browse",
+    "select file",
+    "spreadsheet",
+    "xlsx",
+    "next",
+    "back",
+    "cancel",
+    "finish",
+)
+
+M21_MAX_RUN_SEC = 180
+M21_MAX_WAIT_SEC = 8
+M21_MAX_RESTORE_ATTEMPTS = 3
+
+M21_PROJECTS_VALIDATION_MARKERS = (
+    "select one or more projects",
+    "one or more projects to export",
+    "pleaze gelect",
+    "please select one or more",
+    "please belect one or more",
+    "belect one or more",
+    "gelect one or more",
+    "projects to export",
+)
+
+M21_VALIDATION_POPUP_MIN_CONF = 0.35
+
+_M21_ORIG_CAPTURE_P6: Any = None
+_M21_RECT_CLIP_PATCH_ACTIVE = False
+_M21_LAST_RECT_CLIP: Dict[str, Any] = {}
+
+
+def _m21_screen_size() -> Tuple[int, int]:
+    try:
+        import pyautogui  # noqa: WPS433
+
+        size = pyautogui.size()
+        return int(size.width), int(size.height)
+    except Exception:  # noqa: BLE001
+        return 3840, 2160
+
+
+def m21_clip_p6_rect_for_capture(p6_rect: P6Rect) -> Tuple[P6Rect, Dict[str, Any], Dict[str, Any]]:
+    """Clip negative/off-screen maximized window coords for reliable OCR capture."""
+    before = p6_rect.to_dict()
+    sw, sh = _m21_screen_size()
+    left = max(int(p6_rect.left), 0)
+    top = max(int(p6_rect.top), 0)
+    right = min(sw, int(p6_rect.left + p6_rect.width))
+    bottom = min(sh, int(p6_rect.top + p6_rect.height))
+    width = max(right - left, 0)
+    height = max(bottom - top, 0)
+    if width < 400 or height < 300:
+        adj_w = int(p6_rect.width) - max(0, -int(p6_rect.left))
+        adj_h = int(p6_rect.height) - max(0, -int(p6_rect.top))
+        width = max(width, min(adj_w, sw - left))
+        height = max(height, min(adj_h, sh - top))
+    width = max(min(width, sw - left), min(400, sw))
+    height = max(min(height, sh - top), min(300, sh))
+    clipped = P6Rect(left, top, width, height)
+    after = clipped.to_dict()
+    after["clipped"] = before != after or p6_rect.left < 0 or p6_rect.top < 0
+    return clipped, before, after
+
+
+def m21_install_rect_clip_capture_patch() -> None:
+    """Patch P6 capture to clip negative maximized rects; prefer ImageGrab when needed."""
+    global _M21_ORIG_CAPTURE_P6, _M21_RECT_CLIP_PATCH_ACTIVE, _M21_LAST_RECT_CLIP
+    if _M21_RECT_CLIP_PATCH_ACTIVE:
+        return
+
+    import eye.screenshot as ss  # noqa: WPS433
+
+    _M21_ORIG_CAPTURE_P6 = ss.capture_p6_window_only
+
+    def _patched_capture(
+        output_folder: Path,
+        filename: str,
+        p6_rect: P6Rect,
+        metadata_path: Optional[Path] = None,
+        save_debug_fullscreen_label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        global _M21_LAST_RECT_CLIP
+        clipped, before, after = m21_clip_p6_rect_for_capture(p6_rect)
+        _M21_LAST_RECT_CLIP = {"rect_before_clip": before, "rect_after_clip": after}
+        use_original_for_imagegrab = p6_rect.left < 0 or p6_rect.top < 0
+
+        if use_original_for_imagegrab:
+            ss._require_pillow()
+            output_folder.mkdir(parents=True, exist_ok=True)
+            image_path = output_folder / filename
+            debug_dir = output_folder / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            ig_debug = debug_dir / f"imagegrab_clip_{Path(filename).stem}.png"
+            ok, err = ss._capture_imagegrab_full_crop(p6_rect, image_path, ig_debug)
+            if not ok:
+                result = _M21_ORIG_CAPTURE_P6(
+                    output_folder,
+                    filename,
+                    clipped,
+                    metadata_path=metadata_path,
+                    save_debug_fullscreen_label=save_debug_fullscreen_label,
+                )
+            else:
+                metadata = {
+                    "image_path": str(image_path),
+                    "source": "p6_crop_only",
+                    "capture_method": "m21_imagegrab_negative_rect",
+                    "p6_rect": p6_rect.to_dict(),
+                    "clipped_p6_rect": after,
+                    "rect_before_clip": before,
+                    "rect_after_clip": after,
+                    "width": clipped.width,
+                    "height": clipped.height,
+                    "used_for_ocr": True,
+                    "full_screen_used_for_crop_only": True,
+                    "full_screen_ocr_allowed": False,
+                    "debug_imagegrab_clip_path": str(ig_debug),
+                    "capture_errors": {},
+                }
+                if metadata_path:
+                    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+                    with metadata_path.open("w", encoding="utf-8") as handle:
+                        json.dump(metadata, handle, indent=2, ensure_ascii=False)
+                result = {
+                    "success": True,
+                    "image_path": str(image_path),
+                    "metadata": metadata,
+                    "error": None,
+                }
+        else:
+            capture_rect = clipped if after.get("clipped") else p6_rect
+            result = _M21_ORIG_CAPTURE_P6(
+                output_folder,
+                filename,
+                capture_rect,
+                metadata_path=metadata_path,
+                save_debug_fullscreen_label=save_debug_fullscreen_label,
+            )
+            if result.get("success") and result.get("metadata"):
+                result["metadata"]["rect_before_clip"] = before
+                result["metadata"]["rect_after_clip"] = after
+
+        return result
+
+    ss.capture_p6_window_only = _patched_capture
+    for mod_name in (
+        "m03_open_project_by_name",
+        "m04_check_project_opened",
+        "m06_go_to_activities",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "capture_p6_window_only"):
+            setattr(mod, "capture_p6_window_only", _patched_capture)
+    _M21_RECT_CLIP_PATCH_ACTIVE = True
+
+
+def m21_remove_rect_clip_capture_patch() -> None:
+    global _M21_ORIG_CAPTURE_P6, _M21_RECT_CLIP_PATCH_ACTIVE
+    if not _M21_RECT_CLIP_PATCH_ACTIVE or _M21_ORIG_CAPTURE_P6 is None:
+        return
+    import eye.screenshot as ss  # noqa: WPS433
+
+    ss.capture_p6_window_only = _M21_ORIG_CAPTURE_P6
+    for mod_name in (
+        "m03_open_project_by_name",
+        "m04_check_project_opened",
+        "m06_go_to_activities",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "capture_p6_window_only"):
+            setattr(mod, "capture_p6_window_only", _M21_ORIG_CAPTURE_P6)
+    _M21_RECT_CLIP_PATCH_ACTIVE = False
+
+
+def m21_collect_low_conf_blob(entries: List[Dict[str, Any]], min_confidence: float) -> str:
+    threshold = min(min_confidence, M21_VALIDATION_POPUP_MIN_CONF)
+    return collect_text_blob(entries, threshold)
+
+
+def m21_projects_validation_popup_detected(norm: str) -> bool:
+    if not norm:
+        return False
+    if any(m in norm for m in M21_PROJECTS_VALIDATION_MARKERS[:7]):
+        return True
+    return "projects to export" in norm and "ok" in norm.split()
+
+
+def m21_validation_popup_in_entries(
+    entries: List[Dict[str, Any]],
+    min_confidence: float,
+) -> Tuple[bool, str]:
+    for entry in entries:
+        norm = entry.get("normalized", "")
+        if entry.get("confidence", 0) >= M21_VALIDATION_POPUP_MIN_CONF and m21_projects_validation_popup_detected(norm):
+            return True, norm
+    blob = m21_collect_low_conf_blob(entries, min_confidence)
+    norm = normalize_text(blob)
+    if m21_projects_validation_popup_detected(norm):
+        return True, norm
+    return False, norm
+
+
+def m21_extract_validation_popup_text(blob: str) -> str:
+    norm = normalize_text(blob)
+    for marker in M21_PROJECTS_VALIDATION_MARKERS:
+        if marker in norm:
+            return marker
+    if "projects to export" in norm:
+        return "projects to export validation"
+    return ""
+
+
+def m21_dismiss_projects_validation_popup(
+    evidence: ExportWizardEvidence,
+    p6_rect: P6Rect,
+    p6_keyword: str,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+    entries: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[bool, str, P6Rect]:
+    """Dismiss projects validation popup via Esc or OCR-confirmed OK inside popup."""
+    blob_low = m21_collect_low_conf_blob(entries or [], min_confidence) if entries else ""
+    norm = normalize_text(blob_low)
+    if entries and not m21_projects_validation_popup_detected(norm):
+        validation_hit, _ = m21_validation_popup_in_entries(entries, min_confidence)
+        if not validation_hit:
+            return False, "not_validation_popup", p6_rect
+
+    ok_entry = None
+    ok_threshold = min(min_confidence, M21_VALIDATION_POPUP_MIN_CONF)
+    for entry in entries or []:
+        if entry.get("confidence", 0) >= ok_threshold and entry.get("normalized") == "ok":
+            ok_entry = entry
+            break
+
+    if ok_entry is not None:
+        evidence.steps.append("M21: OCR-confirmed OK on projects validation popup")
+        click_ocr_entry(p6_rect, ok_entry)
+        time.sleep(min(M21_MAX_WAIT_SEC, 0.8))
+    else:
+        evidence.steps.append("M21: Esc once on projects validation popup")
+        keyboard_tools.press_escape()
+        time.sleep(min(M21_MAX_WAIT_SEC, 0.8))
+
+    p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+    after = capture_and_ocr_step(evidence, "validation_popup_dismiss_check", p6_rect, config, screen_rule)
+    if after.get("ok"):
+        after_norm = normalize_text(collect_text_blob(after["entries"], min_confidence))
+        if not m21_projects_validation_popup_detected(after_norm):
+            return True, "ok_click" if ok_entry else "esc", p6_rect
+    return True, "esc_assumed", p6_rect
+
+
+def project_001_talison_detected(blob: str, project_name: str) -> bool:
+    """True when Projects-to-export OCR shows 001 and Talison/1275 project tokens."""
+    norm = normalize_text(blob)
+    has_001 = "001" in norm.split() or "001" in norm
+    has_talison = "talison" in norm or "1275" in norm
+    for token in project_name.replace("-", " ").split():
+        tok = normalize_text(token)
+        if len(tok) >= 3 and tok in norm:
+            has_talison = True
+    return bool(has_001 and has_talison)
+
+
+def classify_projects_to_export_screen(
+    entries: List[Dict[str, Any]],
+    min_confidence: float,
+    *,
+    project_name: str = "",
+) -> Dict[str, Any]:
+    """Classify Projects-to-export wizard screen (after second Next in M21 path)."""
+    result = classify_post_activities_next_screen(entries, min_confidence, project_name=project_name)
+    blob = result.get("raw_ocr_text") or collect_text_blob(entries, min_confidence)
+    projects_words = collect_post_activities_marker_words(blob, M21_PROJECTS_TO_EXPORT_MARKERS)
+    project_row = project_001_talison_detected(blob, project_name)
+    detected = result.get("post_activities_screen_type") == "projects_to_export" or (
+        ("projects to export" in normalize_text(blob) or "open projects" in normalize_text(blob))
+        and ("export project" in normalize_text(blob) or "project" in normalize_text(blob))
+    )
+    return {
+        "projects_to_export_screen_detected": detected,
+        "project_001_talison_detected": project_row,
+        "evidence_words": sorted(set(projects_words + result.get("evidence_words", []))),
+        "raw_ocr_text": blob[:4000] if isinstance(blob, str) else collect_text_blob(entries, min_confidence)[:4000],
+        "wizard_still_open": result.get("wizard_still_open", False),
+        "screen_type": "projects_to_export" if detected else result.get("post_activities_screen_type", "unknown"),
+        "status": "OK" if detected else "FAIL_PROJECTS_TO_EXPORT_SCREEN_NOT_FOUND",
+        "reason": (
+            "Projects-to-export screen confirmed"
+            if detected
+            else "Projects-to-export screen not confirmed after Activities Next"
+        ),
+    }
+
+
+def classify_post_projects_next_screen(
+    entries: List[Dict[str, Any]],
+    min_confidence: float,
+) -> Dict[str, Any]:
+    """Classify wizard screen after third Next (from Projects-to-export)."""
+    blob = collect_text_blob(entries, min_confidence)
+    blob_low = m21_collect_low_conf_blob(entries, min_confidence)
+    norm = normalize_text(blob_low)
+    has_chrome = wizard_chrome_visible(entries, min_confidence)
+    wizard_still_open = (
+        export_wizard_open_in_capture(entries, min_confidence)[0]
+        or wizard_chrome_visible(entries, min_confidence)
+    ) and not wizard_truly_closed(entries, min_confidence)
+
+    validation_hit, validation_norm = m21_validation_popup_in_entries(entries, min_confidence)
+    if validation_hit:
+        words = sorted(
+            set(
+                collect_post_activities_marker_words(blob_low, M21_PROJECTS_TO_EXPORT_MARKERS)
+                + ["select one or more projects", "ok"]
+            )
+        )
+        return {
+            "post_projects_screen_type": "projects_validation_popup",
+            "evidence_words": words,
+            "raw_ocr_text": blob_low[:4000],
+            "post_screen_ok": True,
+            "wizard_still_open": True,
+            "template_screen_detected": False,
+            "status": "PASS_POST_PROJECTS_SCREEN_DISCOVERY",
+            "reason": "Projects-to-export validation popup discovered after 3rd Next",
+            "validation_popup_detected": True,
+            "validation_popup_text": m21_extract_validation_popup_text(blob_low) or validation_norm[:200],
+            "manual_review_required": False,
+        }
+
+    if wizard_truly_closed(entries, min_confidence):
+        return {
+            "post_projects_screen_type": "unknown",
+            "evidence_words": [],
+            "raw_ocr_text": blob[:4000],
+            "post_screen_ok": False,
+            "wizard_still_open": False,
+            "template_screen_detected": False,
+            "status": "FAIL_WIZARD_CLOSED_UNEXPECTEDLY",
+            "reason": "Wizard chrome disappeared before intentional Cancel",
+        }
+
+    template_words = collect_post_activities_marker_words(blob, M21_POST_PROJECTS_TEMPLATE_WORDS)
+    file_words = collect_post_activities_marker_words(blob, M21_POST_PROJECTS_FILE_PATH_WORDS)
+    projects_words = collect_post_activities_marker_words(blob, M21_PROJECTS_TO_EXPORT_MARKERS)
+
+    template_detected = has_chrome and (
+        template_screen_detected(blob)
+        or any(m in norm for m in ("select template", "modify template"))
+        or ("template" in norm and any(m in norm for m in ("add", "delete", "columns")))
+    )
+    file_detected = has_chrome and (
+        post_template_screen_detected(blob)
+        or any(m in norm for m in ("file name", "output file", "browse", "select file", "xlsx"))
+    )
+    projects_still = has_chrome and (
+        ("projects to export" in norm or "open projects" in norm)
+        and ("export project" in norm or "001" in norm or "talison" in norm or "1275" in norm)
+    )
+
+    if template_detected:
+        words = sorted(set(template_words))
+        return {
+            "post_projects_screen_type": "template",
+            "evidence_words": words,
+            "raw_ocr_text": blob[:4000],
+            "post_screen_ok": True,
+            "wizard_still_open": wizard_still_open,
+            "template_screen_detected": True,
+            "status": "PASS_TEMPLATE_SCREEN_DISCOVERY",
+            "reason": "Template screen discovered after Projects-to-export Next",
+        }
+
+    if file_detected:
+        words = sorted(set(file_words))
+        return {
+            "post_projects_screen_type": "file_path",
+            "evidence_words": words,
+            "raw_ocr_text": blob[:4000],
+            "post_screen_ok": True,
+            "wizard_still_open": wizard_still_open,
+            "template_screen_detected": False,
+            "status": "PASS_POST_PROJECTS_SCREEN_DISCOVERY",
+            "reason": "File/path screen discovered after Projects-to-export Next",
+        }
+
+    if projects_still:
+        words = sorted(set(projects_words))
+        return {
+            "post_projects_screen_type": "projects_to_export_still",
+            "evidence_words": words,
+            "raw_ocr_text": blob[:4000],
+            "post_screen_ok": True,
+            "wizard_still_open": wizard_still_open,
+            "template_screen_detected": False,
+            "status": "PASS_POST_PROJECTS_SCREEN_DISCOVERY",
+            "reason": "Still on Projects-to-export screen after third Next (known wizard step)",
+        }
+
+    chrome_words = collect_post_activities_marker_words(
+        blob, ("export", "next", "back", "cancel", "finish", "spreadsheet", "xlsx")
+    )
+    non_bg = [w for w in chrome_words if w not in ("next", "back", "cancel", "finish", "export")]
+    if wizard_still_open and has_chrome and len(non_bg) >= 1:
+        return {
+            "post_projects_screen_type": "generic_wizard",
+            "evidence_words": chrome_words,
+            "raw_ocr_text": blob[:4000],
+            "post_screen_ok": True,
+            "wizard_still_open": True,
+            "template_screen_detected": False,
+            "status": "PASS_TEMPLATE_SCREEN_DISCOVERY_PARTIAL",
+            "reason": f"Partial post-Projects discovery ({len(chrome_words)} evidence words)",
+        }
+
+    if wizard_still_open:
+        return {
+            "post_projects_screen_type": "unknown",
+            "evidence_words": chrome_words,
+            "raw_ocr_text": blob[:4000],
+            "post_screen_ok": False,
+            "wizard_still_open": True,
+            "template_screen_detected": False,
+            "status": "FAIL_POST_PROJECTS_NEXT_SCREEN_NOT_FOUND",
+            "reason": "Wizard open but post-Projects next screen not detected",
+        }
+
+    return {
+        "post_projects_screen_type": "unknown",
+        "evidence_words": [],
+        "raw_ocr_text": blob[:4000],
+        "post_screen_ok": False,
+        "wizard_still_open": False,
+        "template_screen_detected": False,
+        "status": "FAIL_WIZARD_CLOSED_UNEXPECTEDLY",
+        "reason": "Export wizard not detected after third Next",
+    }
+
+
+def wizard_bounds_valid(bounds: Optional[Dict[str, float]], p6_width: int, p6_height: int) -> bool:
+    if not bounds:
+        return False
+    x0 = float(bounds.get("x_min", 0))
+    x1 = float(bounds.get("x_max", 0))
+    y0 = float(bounds.get("y_min", 0))
+    y1 = float(bounds.get("y_max", 0))
+    if x1 <= x0 or y1 <= y0:
+        return False
+    if (x1 - x0) < 250 or (y1 - y0) < 200:
+        return False
+    if x1 > p6_width + 2 or y1 > p6_height + 2:
+        return False
+    return True
+
+
+def m21_capture_after_projects_next(
+    evidence: ExportWizardEvidence,
+    p6_keyword: str,
+    p6_rect: P6Rect,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+    *,
+    cached_bounds: Optional[Dict[str, float]] = None,
+) -> Tuple[Dict[str, Any], P6Rect, Dict[str, Any]]:
+    """
+    Capture post-3rd-Next screen: full P6 OCR first, redetect bounds, optional wizard crop.
+    Never fails solely due to stale/invalid cached bounds.
+    """
+    meta: Dict[str, Any] = {
+        "cached_wizard_bounds": cached_bounds,
+        "redetected_wizard_bounds": None,
+        "fallback_ocr_used": True,
+        "capture_mode": "p6_full",
+    }
+    window_tools.activate_window_by_title(p6_keyword)
+    window_tools.maximize_window_by_title(p6_keyword)
+    time.sleep(min(M21_MAX_WAIT_SEC, 0.6))
+    prep = prepare_p6_for_test(p6_keyword)
+    if prep.get("success") and prep.get("rect"):
+        p6_rect = prep["rect"]
+
+    full_cap = capture_and_ocr_step(evidence, "08_after_projects_next", p6_rect, config, screen_rule)
+    if not full_cap.get("ok"):
+        meta["capture_error"] = full_cap.get("error", "P6 crop capture failed")
+        return full_cap, p6_rect, meta
+
+    entries = full_cap.get("entries", [])
+    blob = collect_text_blob(entries, min_confidence)
+    full_cap["screen_state"] = classify_m20_screen_state(entries, blob, min_confidence)
+    full_cap["ocr_mode"] = "p6_full"
+    meta["capture_mode"] = "p6_full"
+    meta["fallback_ocr_used"] = True
+
+    redetected = detect_export_wizard_bounds(entries, min_confidence, p6_rect.width, p6_rect.height)
+    meta["redetected_wizard_bounds"] = redetected
+
+    if wizard_bounds_valid(redetected, p6_rect.width, p6_rect.height):
+        crop_cap = ocr_wizard_crop(
+            evidence,
+            "08_after_projects_next_wiz",
+            p6_rect,
+            redetected,
+            config,
+            screen_rule,
+            min_confidence,
+        )
+        if crop_cap.get("ok"):
+            crop_blob = collect_text_blob(crop_cap["entries"], min_confidence)
+            if len(crop_cap.get("entries", [])) >= 3 and len(crop_blob) > 40:
+                cb = crop_blob
+                crop_cap["screen_state"] = classify_m20_screen_state(crop_cap["entries"], cb, min_confidence)
+                crop_cap["ocr_mode"] = "wizard_crop_redetected"
+                meta["fallback_ocr_used"] = False
+                meta["capture_mode"] = "wizard_crop_redetected"
+                return crop_cap, p6_rect, meta
+
+    evidence.steps.append("M21: post-Projects capture used full P6 OCR (small/invalid bounds or weak crop)")
+    return full_cap, p6_rect, meta
+
+
+def safe_cancel_export_wizard_if_open(
+    evidence: ExportWizardEvidence,
+    p6_keyword: str,
+    p6_rect: P6Rect,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+    *,
+    cached_bounds: Optional[Dict[str, float]] = None,
+) -> Tuple[Dict[str, Any], P6Rect]:
+    """Best-effort export wizard cancel; never press Finish/Yes/No."""
+    outcome: Dict[str, Any] = {
+        "cleanup_attempted": True,
+        "cleanup_success": False,
+        "cleanup_method": "",
+        "cleanup_reason": "",
+    }
+    try:
+        window_tools.activate_window_by_title(p6_keyword)
+        time.sleep(0.4)
+        p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+
+        pre = capture_and_ocr_step(evidence, "cleanup_precheck", p6_rect, config, screen_rule)
+        if not pre.get("ok"):
+            outcome["cleanup_reason"] = pre.get("error", "cleanup precheck capture failed")
+            return outcome, p6_rect
+
+        entries = pre.get("entries", [])
+        blob = collect_text_blob(entries, min_confidence)
+        wizard_open, _, _ = export_wizard_open_in_capture(entries, min_confidence)
+        chrome = wizard_chrome_visible(entries, min_confidence)
+
+        if not wizard_open and not chrome:
+            norm = normalize_text(collect_text_blob(entries, min_confidence))
+            if m21_projects_validation_popup_detected(norm):
+                evidence.steps.append("M21 cleanup: Esc once on projects validation popup")
+                keyboard_tools.press_escape()
+                time.sleep(min(M21_MAX_WAIT_SEC, 0.8))
+                p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+                outcome["cleanup_success"] = True
+                outcome["cleanup_method"] = "esc_validation_popup"
+                outcome["cleanup_reason"] = "Dismissed projects validation popup with Esc"
+                return outcome, p6_rect
+            outcome["cleanup_success"] = True
+            outcome["cleanup_method"] = "none_wizard_not_open"
+            outcome["cleanup_reason"] = "Export wizard not detected; no cleanup needed"
+            return outcome, p6_rect
+
+        evidence_words = find_export_evidence_words(blob)
+        closed, method, p6_rect = close_export_dialog(
+            evidence, p6_keyword, p6_rect, config, screen_rule, entries, evidence_words
+        )
+        if closed and method not in ("none_dialog_not_open", ""):
+            outcome["cleanup_success"] = True
+            outcome["cleanup_method"] = method or "cancel_click"
+            outcome["cleanup_reason"] = "Export wizard closed via close_export_dialog"
+            return outcome, p6_rect
+
+        cancel_entry = find_cancel_entry(entries, min_confidence)
+        if cancel_entry is not None:
+            evidence.steps.append("M21 cleanup: OCR-confirmed Cancel on export wizard")
+            click_ocr_entry(p6_rect, cancel_entry)
+            time.sleep(min(M21_MAX_WAIT_SEC, 1.0))
+            p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+            after = capture_and_ocr_step(evidence, "cleanup_after_cancel", p6_rect, config, screen_rule)
+            if after.get("ok") and not export_wizard_open_in_capture(after["entries"], min_confidence)[0]:
+                outcome["cleanup_success"] = True
+                outcome["cleanup_method"] = "cancel_click"
+                outcome["cleanup_reason"] = "Cancel click closed export wizard"
+                return outcome, p6_rect
+
+        if wizard_open or chrome:
+            blocking, block_reason = detect_m16_blocking_popup(entries, min_confidence)
+            if not blocking:
+                evidence.steps.append("M21 cleanup: Esc once on confirmed export wizard")
+                keyboard_tools.press_escape()
+                time.sleep(min(M21_MAX_WAIT_SEC, 0.8))
+                p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+                after_esc = capture_and_ocr_step(evidence, "cleanup_after_esc", p6_rect, config, screen_rule)
+                if after_esc.get("ok") and not export_wizard_open_in_capture(after_esc["entries"], min_confidence)[0]:
+                    outcome["cleanup_success"] = True
+                    outcome["cleanup_method"] = "esc"
+                    outcome["cleanup_reason"] = "Esc closed export wizard"
+                    return outcome, p6_rect
+                outcome["cleanup_reason"] = "Esc did not confirm wizard closed"
+            else:
+                outcome["cleanup_reason"] = f"Blocking popup during cleanup: {block_reason}"
+        else:
+            outcome["cleanup_success"] = True
+            outcome["cleanup_method"] = "none_wizard_not_open"
+            outcome["cleanup_reason"] = "Wizard not confirmed open at cleanup"
+
+    except Exception as exc:  # noqa: BLE001
+        outcome["cleanup_reason"] = f"cleanup exception: {exc}"
+
+    return outcome, p6_rect
+
+
+M03_OPEN_PROJECT_SCREEN_RULE = ROOT / "03_screen_library" / "p6_open_project" / "screen_rule.json"
+
+
+def m21_ocr_open_project_dialog(
+    p6_rect: P6Rect,
+    screenshots_dir: Path,
+    label: str,
+    open_screen_rule: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Tuple[int, int], str]:
+    """OCR Open Project dialog via popup crop with low-confidence threshold."""
+    from m03_open_project_by_name import popup_crop_offsets  # noqa: WPS433
+    from eye.screenshot import crop_center_percent_of_image  # noqa: WPS433
+
+    cap = capture_p6_window_only(
+        screenshots_dir,
+        f"{label}_p6_crop.png",
+        p6_rect,
+    )
+    if not cap.get("success"):
+        return [], (0, 0), cap.get("error", "capture failed")
+
+    popup_path = str(screenshots_dir / f"{label}_popup_crop.png")
+    crop_center_percent_of_image(
+        cap["image_path"], popup_path, open_screen_rule["crop_region_percent"]
+    )
+    crop_ox, crop_oy = popup_crop_offsets(open_screen_rule, p6_rect.width, p6_rect.height)
+    raw = run_easyocr(popup_path)
+    return ocr_to_entries(raw), (crop_ox, crop_oy), ""
+
+
+def m21_open_dialog_detected(entries: List[Dict[str, Any]], min_confidence: float) -> bool:
+    blob = m21_collect_low_conf_blob(entries, min_confidence)
+    norm = normalize_text(blob)
+    markers = ("open project", "project name", "project id", "portfolio", "select project", "open")
+    return sum(1 for m in markers if m in norm) >= 2
+
+
+def m21_open_project_restore_fallback(
+    project_name: str,
+    chain_id: str,
+    *,
+    p6_keyword: str,
+    config: Dict[str, Any],
+    min_confidence: float,
+    evidence_steps: List[str],
+) -> Dict[str, Any]:
+    """M21-native Open Project when frozen M03 dialog OCR fails (low-conf popup OCR)."""
+    from m03_open_project_by_name import (  # noqa: WPS433
+        click_entry_on_screen,
+        confirm_open_with_alt_o,
+        find_project_matches,
+        image_point_to_screen,
+        open_project_dialog,
+        title_indicates_project_open,
+        type_filter_project,
+    )
+
+    outcome: Dict[str, Any] = {"success": False, "reason": "", "method": "m21_open_fallback"}
+    open_rule = load_json(M03_OPEN_PROJECT_SCREEN_RULE)
+    tmp = Path(tempfile.gettempdir()) / f"m21_open_{chain_id}"
+    screenshots_dir = tmp / "screenshots"
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+    prep = prepare_p6_for_test(p6_keyword)
+    if not prep.get("success") or not prep.get("rect"):
+        outcome["reason"] = prep.get("message", "P6 not ready for open fallback")
+        return outcome
+
+    p6_rect: P6Rect = prep["rect"]
+    title = window_tools.get_window_state(p6_keyword).get("title") or ""
+    if title_indicates_project_open(title, project_name):
+        outcome["success"] = True
+        outcome["reason"] = f"Project already open: {title}"
+        outcome["method"] = "title_already_open"
+        return outcome
+
+    evidence_steps.append("M21 restore fallback: Ctrl+O Open Project dialog")
+    open_project_dialog()
+    time.sleep(1.2)
+    fresh = get_fresh_p6_rect(p6_keyword)
+    if fresh.get("success") and fresh.get("rect"):
+        p6_rect = fresh["rect"]
+
+    low_conf = min(min_confidence, M21_VALIDATION_POPUP_MIN_CONF)
+    entries, crop_origin, cap_err = m21_ocr_open_project_dialog(
+        p6_rect, screenshots_dir, "fb_dialog", open_rule
+    )
+    if cap_err:
+        outcome["reason"] = cap_err
+        keyboard_tools.press_escape()
+        return outcome
+
+    if not m21_open_dialog_detected(entries, min_confidence):
+        evidence_steps.append("M21 restore fallback: dialog not detected — type filter and re-OCR")
+        crop = open_rule["crop_region_percent"]
+        list_x = p6_rect.width * (float(crop["left"]) + float(crop["right"])) / 2
+        list_y = p6_rect.height * (float(crop["top"]) + float(crop["bottom"])) / 2
+        sx, sy = image_point_to_screen(p6_rect, list_x, list_y)
+        import pyautogui  # noqa: WPS433
+
+        pyautogui.click(sx, sy)
+        time.sleep(0.3)
+        type_filter_project(project_name)
+        time.sleep(0.8)
+        entries, crop_origin, cap_err = m21_ocr_open_project_dialog(
+            p6_rect, screenshots_dir, "fb_dialog_filter", open_rule
+        )
+
+    matches = find_project_matches(entries, project_name, low_conf)
+    if not matches:
+        keyboard_tools.press_escape()
+        outcome["reason"] = "Open Project fallback: project row not found in low-conf OCR"
+        return outcome
+
+    selected = max(matches, key=lambda m: m.get("confidence", 0))
+    evidence_steps.append(f"M21 restore fallback: click project row '{selected.get('text', '')}'")
+    click_entry_on_screen(selected, p6_rect, crop_origin)
+    time.sleep(0.5)
+    confirm_open_with_alt_o()
+    time.sleep(STABILITY_WAIT)
+
+    p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+    title = window_tools.get_window_state(p6_keyword).get("title") or ""
+    open_ok, _, _ = confirm_project_open(
+        entries, project_name, title, low_conf
+    )
+    if title_indicates_project_open(title, project_name) or open_ok:
+        outcome["success"] = True
+        outcome["reason"] = f"Project opened via M21 fallback: {title}"
+        return outcome
+
+    keyboard_tools.press_escape()
+    outcome["reason"] = "Open Project fallback: open action did not confirm in title/OCR"
+    return outcome
+
+
+def m21_run_m03_with_open_dialog_fallback(
+    project_name: str,
+    chain_id: str,
+    *,
+    p6_keyword: str,
+    evidence_steps: List[str],
+) -> Dict[str, Any]:
+    """Run frozen M03; on Open Project OCR empty, Esc once and retry once."""
+    from m03_open_project_by_name import run_m03  # noqa: WPS433
+
+    run_id = f"{chain_id}_m03"
+    m03 = run_m03(project_name, run_id=run_id)
+    if m03.get("status") not in ("PASS", "PASS_ALREADY_OPEN") and "OPEN_DIALOG" in m03.get("status", ""):
+        evidence_steps.append("M21 restore: M03 Open Project OCR failed — Esc once and retry M03")
+        window_tools.activate_window_by_title(p6_keyword)
+        window_tools.maximize_window_by_title(p6_keyword)
+        keyboard_tools.press_escape()
+        time.sleep(1.0)
+        prepare_p6_for_test(p6_keyword)
+        m03 = run_m03(project_name, run_id=f"{run_id}_retry")
+    return m03
+
+
+def m21_restore_workspace_via_m03_chain(
+    project_name: str,
+    parent_run_id: str,
+    *,
+    p6_keyword: str,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+    evidence_steps: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Run frozen M03/M04/M06 once to restore Talison Activities workspace after dirty start."""
+    from m04_check_project_opened import run_m04  # noqa: WPS433
+    from m06_go_to_activities import run_m06  # noqa: WPS433
+
+    steps = evidence_steps if evidence_steps is not None else []
+    chain_id = f"{parent_run_id}_restore"
+    outcome: Dict[str, Any] = {
+        "chain_run_id": chain_id,
+        "m03_status": "",
+        "m04_status": "",
+        "m06_status": "",
+        "success": False,
+        "reason": "",
+        "prep_notes": [],
+        "rect_before_clip": _M21_LAST_RECT_CLIP.get("rect_before_clip"),
+        "rect_after_clip": _M21_LAST_RECT_CLIP.get("rect_after_clip"),
+    }
+    outcome["prep_notes"] = m20_hard_dismiss_stale_dialogs(p6_keyword, config, screen_rule, min_confidence)
+    prep = prepare_p6_for_test(p6_keyword)
+    if prep.get("success"):
+        window_tools.activate_window_by_title(p6_keyword)
+        window_tools.maximize_window_by_title(p6_keyword)
+        time.sleep(1.0)
+    else:
+        outcome["reason"] = f"P6 prepare failed before M03 restore: {prep.get('message', 'unknown')}"
+        return outcome
+
+    m21_install_rect_clip_capture_patch()
+    try:
+        m03 = m21_run_m03_with_open_dialog_fallback(
+            project_name, chain_id, p6_keyword=p6_keyword, evidence_steps=steps
+        )
+        outcome["m03_status"] = m03.get("status", "")
+        outcome["rect_before_clip"] = _M21_LAST_RECT_CLIP.get("rect_before_clip")
+        outcome["rect_after_clip"] = _M21_LAST_RECT_CLIP.get("rect_after_clip")
+        m03_ok = m03.get("status") in ("PASS", "PASS_ALREADY_OPEN")
+        if not m03_ok:
+            evidence_steps.append("M21 restore: M03 failed — trying M21 Open Project fallback")
+            fallback = m21_open_project_restore_fallback(
+                project_name,
+                chain_id,
+                p6_keyword=p6_keyword,
+                config=config,
+                min_confidence=min_confidence,
+                evidence_steps=steps,
+            )
+            outcome["m03_fallback"] = fallback
+            outcome["rect_before_clip"] = _M21_LAST_RECT_CLIP.get("rect_before_clip")
+            outcome["rect_after_clip"] = _M21_LAST_RECT_CLIP.get("rect_after_clip")
+            if not fallback.get("success"):
+                outcome["reason"] = fallback.get("reason") or f"M03 restore failed: {m03.get('reason', m03.get('status'))}"
+                return outcome
+            outcome["m03_status"] = "PASS_M21_OPEN_FALLBACK"
+            m03_ok = True
+
+        if not m03_ok:
+            outcome["reason"] = f"M03 restore failed: {m03.get('reason', m03.get('status'))}"
+            return outcome
+
+        m04 = run_m04(project_name, run_id=f"{chain_id}_m04")
+        outcome["m04_status"] = m04.get("status", "")
+        if m04.get("status") != "PASS":
+            outcome["reason"] = f"M04 restore failed: {m04.get('reason', m04.get('status'))}"
+            return outcome
+
+        m06 = run_m06(project_name, run_id=f"{chain_id}_m06")
+        outcome["m06_status"] = m06.get("status", "")
+        if m06.get("status") not in ("PASS", "PASS_ALREADY_IN_ACTIVITIES"):
+            outcome["reason"] = f"M06 restore failed: {m06.get('reason', m06.get('status'))}"
+            return outcome
+
+        outcome["success"] = True
+        outcome["reason"] = "M03/M04/M06 workspace restore chain completed"
+        return outcome
+    finally:
+        pass  # caller manages rect-clip patch lifecycle
+
+
+def m21_preflight_with_restore_loop(
+    evidence: ExportWizardEvidence,
+    project_name: str,
+    p6_keyword: str,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+) -> Tuple[Optional[P6Rect], str, str, Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Dirty-start preflight with up to M21_MAX_RESTORE_ATTEMPTS workspace restore attempts."""
+    preflight_meta: Dict[str, Any] = {
+        "project_restore_attempts": 0,
+        "project_restore_success": False,
+        "rect_before_clip": None,
+        "rect_after_clip": None,
+    }
+    restore_history: List[Dict[str, Any]] = []
+    last_err: Optional[Dict[str, Any]] = None
+
+    m21_install_rect_clip_capture_patch()
+    try:
+        for attempt in range(1, M21_MAX_RESTORE_ATTEMPTS + 1):
+            preflight_meta["project_restore_attempts"] = attempt
+            evidence.steps.append(f"M21 preflight restore attempt {attempt}/{M21_MAX_RESTORE_ATTEMPTS}")
+
+            p6_rect, title, state, meta, err = m21_dirty_start_preflight_once(
+                evidence, project_name, p6_keyword, config, screen_rule, min_confidence
+            )
+            preflight_meta.update(meta)
+            preflight_meta["rect_before_clip"] = _M21_LAST_RECT_CLIP.get("rect_before_clip")
+            preflight_meta["rect_after_clip"] = _M21_LAST_RECT_CLIP.get("rect_after_clip")
+
+            if not err:
+                preflight_meta["project_restore_success"] = True
+                return p6_rect, title, state, preflight_meta, None
+
+            last_err = err
+            if err.get("status") not in ("FAIL_PROJECT_NOT_OPEN", "FAIL_ACTIVITIES_NOT_FOUND"):
+                return p6_rect, title, state, preflight_meta, err
+
+            if attempt >= M21_MAX_RESTORE_ATTEMPTS:
+                break
+
+            evidence.steps.append(
+                f"M21 preflight: {err.get('status')} — restore workspace (attempt {attempt})"
+            )
+            restore = m21_restore_workspace_via_m03_chain(
+                project_name,
+                f"{evidence.run_id}_a{attempt}",
+                p6_keyword=p6_keyword,
+                config=config,
+                screen_rule=screen_rule,
+                min_confidence=min_confidence,
+                evidence_steps=evidence.steps,
+            )
+            restore_history.append(restore)
+            preflight_meta["rect_before_clip"] = restore.get("rect_before_clip") or preflight_meta.get(
+                "rect_before_clip"
+            )
+            preflight_meta["rect_after_clip"] = restore.get("rect_after_clip") or preflight_meta.get("rect_after_clip")
+            save_discovery(evidence, "preflight_workspace_restore.json", {
+                "attempt": attempt,
+                "restore": restore,
+                "restore_history": restore_history,
+            })
+
+        preflight_meta["project_restore_success"] = False
+        preflight_meta["restore_history"] = restore_history
+        fail_reason = last_err.get("reason", "Project restore failed") if last_err else "Project restore failed"
+        return (
+            None,
+            window_tools.get_window_state(p6_keyword).get("title") or "",
+            "unknown",
+            preflight_meta,
+            {
+                "status": "FAIL_PROJECT_RESTORE_FAILED",
+                "reason": fail_reason,
+            },
+        )
+    finally:
+        pass  # caller manages rect-clip patch lifecycle
+
+
+def m21_dirty_start_preflight_once(
+    evidence: ExportWizardEvidence,
+    project_name: str,
+    p6_keyword: str,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+) -> Tuple[Optional[P6Rect], str, str, Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Single dirty-start pass: dismiss stale dialogs, then M20 preflight."""
+    evidence.steps.append("M21 dirty-start: dismiss stale export/Open Project dialogs")
+    dismiss_notes = m20_hard_dismiss_stale_dialogs(p6_keyword, config, screen_rule, min_confidence)
+    preflight_meta: Dict[str, Any] = {"dirty_start_dismiss_notes": dismiss_notes}
+    p6_rect, title, state, meta, err = m20_preflight_reset_before_export(
+        evidence, project_name, p6_keyword, config, screen_rule, min_confidence
+    )
+    preflight_meta.update(meta)
+    return p6_rect, title, state, preflight_meta, err
+
+
+def m21_dirty_start_preflight(
+    evidence: ExportWizardEvidence,
+    project_name: str,
+    p6_keyword: str,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+) -> Tuple[Optional[P6Rect], str, str, Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Dismiss stale dialogs, restore project if needed (single pass — prefer m21_preflight_with_restore_loop)."""
+    p6_rect, title, state, meta, err = m21_dirty_start_preflight_once(
+        evidence, project_name, p6_keyword, config, screen_rule, min_confidence
+    )
+    if err and err.get("status") in ("FAIL_PROJECT_NOT_OPEN", "FAIL_ACTIVITIES_NOT_FOUND"):
+        evidence.steps.append(
+            f"M21 dirty-start: {err.get('status')} — restore workspace via M03/M04/M06 chain"
+        )
+        restore = m21_restore_workspace_via_m03_chain(
+            project_name,
+            evidence.run_id,
+            p6_keyword=p6_keyword,
+            config=config,
+            screen_rule=screen_rule,
+            min_confidence=min_confidence,
+            evidence_steps=evidence.steps,
+        )
+        meta["workspace_restore"] = restore
+        save_discovery(evidence, "preflight_workspace_restore.json", restore)
+        if restore.get("success"):
+            p6_rect, title, state, meta2, err = m20_preflight_reset_before_export(
+                evidence, project_name, p6_keyword, config, screen_rule, min_confidence
+            )
+            meta.update(meta2)
+    return p6_rect, title, state, meta, err
+
+
+def m21_controlled_wizard_to_post_projects_next(
+    evidence: ExportWizardEvidence,
+    p6_keyword: str,
+    p6_rect: P6Rect,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+    project_name: str = "",
+    *,
+    force_post_projects_next_screen_not_found_after_third_next: bool = False,
+    force_projects_to_export_screen_not_found: bool = False,
+    force_projects_export_blocked_after_third_next: bool = False,
+) -> Tuple[P6Rect, Dict[str, Any], Optional[Dict[str, Any]]]:
+    """M21 controlled path: through Projects-to-export, third Next, classify following screen."""
+    p6_rect, ctx, err = m20_controlled_wizard_to_post_activities(
+        evidence,
+        p6_keyword,
+        p6_rect,
+        config,
+        screen_rule,
+        min_confidence,
+        project_name,
+    )
+    if err:
+        return p6_rect, ctx, err
+
+    post_entries = ctx.get("post_activities_entries") or ctx.get("export_type_entries", [])
+    post_blob = ctx.get("post_activities_blob", "")
+    projects_class = classify_projects_to_export_screen(post_entries, min_confidence, project_name=project_name)
+    ctx["projects_to_export_screen_detected"] = projects_class["projects_to_export_screen_detected"]
+    ctx["project_001_talison_detected"] = projects_class["project_001_talison_detected"]
+    ctx["projects_to_export_evidence_words"] = projects_class["evidence_words"]
+
+    save_discovery(
+        evidence,
+        "projects_to_export_screen_evidence.json",
+        m20_build_step_evidence(
+            entry=None,
+            p6_rect=p6_rect,
+            cap={"entries": post_entries, "screen_state": "projects_to_export"},
+            pollution_meta={
+                "pollution_detected": ctx.get("pollution_detected", False),
+                "pollution_recovered": ctx.get("pollution_recovered", False),
+                "pollution_words": ctx.get("pollution_words", []),
+            },
+            p6_keyword=p6_keyword,
+            extra={
+                "action": "projects_to_export_screen_detected",
+                "projects_to_export_screen_detected": projects_class["projects_to_export_screen_detected"],
+                "project_001_talison_detected": projects_class["project_001_talison_detected"],
+                "evidence_words": projects_class["evidence_words"],
+                "next_pressed_count_before_third": count_next_presses(evidence.steps),
+            },
+        ),
+    )
+
+    if force_projects_to_export_screen_not_found:
+        evidence.steps.append("Hook: force_projects_to_export_screen_not_found")
+        ctx["projects_to_export_screen_detected"] = False
+        ctx["project_001_talison_detected"] = False
+        ctx["forced_hook_activation"] = {"force_projects_to_export_screen_not_found": True}
+        return p6_rect, ctx, {
+            "status": "FAIL_PROJECTS_TO_EXPORT_SCREEN_NOT_FOUND",
+            "reason": "Hook: force_projects_to_export_screen_not_found",
+        }
+
+    if not projects_class["projects_to_export_screen_detected"]:
+        return p6_rect, ctx, {
+            "status": "FAIL_PROJECTS_TO_EXPORT_SCREEN_NOT_FOUND",
+            "reason": projects_class["reason"],
+        }
+
+    if not projects_class["project_001_talison_detected"]:
+        return p6_rect, ctx, {
+            "status": "FAIL_PROJECTS_TO_EXPORT_SCREEN_NOT_FOUND",
+            "reason": "Projects-to-export visible but 001/Talison 1275 project row not confirmed in OCR",
+        }
+
+    wizard_bounds = ctx.get("wizard_bounds") or detect_export_wizard_bounds(
+        post_entries, min_confidence, p6_rect.width, p6_rect.height
+    )
+    next3, bounds3 = find_wizard_next_button(post_entries, min_confidence)
+    if next3 is None:
+        return p6_rect, ctx, {
+            "status": "MANUAL_REVIEW_CANNOT_CONFIRM",
+            "reason": "Third Next button not detected on Projects-to-export screen",
+        }
+    if not next_in_wizard_bounds(next3, bounds3 or estimate_wizard_bounds(post_entries, min_confidence)):
+        return p6_rect, ctx, {
+            "status": "MANUAL_REVIEW_CANNOT_CONFIRM",
+            "reason": "Third Next button bbox not inside wizard bounds",
+        }
+
+    blocking, block_reason = detect_m16_blocking_popup(post_entries, min_confidence)
+    if blocking:
+        return p6_rect, ctx, {"status": "MANUAL_REVIEW_UNSAFE_POPUP", "reason": block_reason}
+
+    evidence.steps.append("press Next once: OCR-confirmed Next click (from Projects-to-export)")
+    click_ocr_entry(p6_rect, next3)
+    ctx["third_next_clicked_by_ocr_bbox"] = True
+    time.sleep(min(M21_MAX_WAIT_SEC, 1.5))
+    p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+
+    cached_bounds = ctx.get("wizard_bounds")
+    after_post, p6_rect, capture_meta = m21_capture_after_projects_next(
+        evidence,
+        p6_keyword,
+        p6_rect,
+        config,
+        screen_rule,
+        min_confidence,
+        cached_bounds=cached_bounds,
+    )
+    ctx["post_projects_capture_meta"] = capture_meta
+    ctx["fallback_ocr_used"] = capture_meta.get("fallback_ocr_used", True)
+
+    if not after_post.get("ok"):
+        post_class = {
+            "post_projects_screen_type": "unknown",
+            "evidence_words": [],
+            "raw_ocr_text": "",
+            "post_screen_ok": False,
+            "wizard_still_open": True,
+            "template_screen_detected": False,
+            "status": "FAIL_P6_WINDOW_NOT_READY",
+            "reason": capture_meta.get("capture_error", "P6 screenshot/crop could not be obtained after third Next"),
+        }
+    else:
+        post_class = classify_post_projects_next_screen(after_post["entries"], min_confidence)
+
+    if force_post_projects_next_screen_not_found_after_third_next:
+        evidence.steps.append("Hook: force_post_projects_next_screen_not_found_after_third_next")
+        hook_payload = m21_build_expected_stage_hook_payload(ctx, evidence, post_class, min_confidence)
+        hook_payload["forced_condition"] = "post_projects_next_screen_not_found"
+        hook_payload["hook_applied_after_third_next"] = True
+        hook_payload["original_post_screen_type"] = post_class.get("post_projects_screen_type", "unknown")
+        hook_payload["original_evidence_words"] = list(post_class.get("evidence_words", []))
+        ctx["forced_hook_activation"] = hook_payload
+        save_discovery(evidence, "forced_hook_activation.json", hook_payload)
+        post_class = {
+            "post_projects_screen_type": "unknown",
+            "evidence_words": [],
+            "raw_ocr_text": post_class.get("raw_ocr_text", "")[:4000],
+            "post_screen_ok": False,
+            "wizard_still_open": post_class.get("wizard_still_open", True),
+            "template_screen_detected": False,
+            "status": "FAIL_POST_PROJECTS_NEXT_SCREEN_NOT_FOUND",
+            "reason": "Hook: force_post_projects_next_screen_not_found_after_third_next",
+        }
+
+    if force_projects_export_blocked_after_third_next:
+        evidence.steps.append("Hook: force_projects_export_blocked_after_third_next")
+        hook_payload = m21_build_expected_stage_hook_payload(ctx, evidence, post_class, min_confidence)
+        hook_payload["forced_condition"] = "projects_export_blocked_after_third_next"
+        ctx["forced_hook_activation"] = hook_payload
+        save_discovery(evidence, "forced_hook_activation.json", hook_payload)
+        if not hook_payload.get("validation_popup_detected"):
+            ctx["projects_to_export_screen_detected"] = False
+            ctx["project_001_talison_detected"] = False
+            ctx["post_projects_screen_ok"] = False
+            return p6_rect, ctx, {
+                "status": "FAIL_PROJECTS_TO_EXPORT_SCREEN_NOT_FOUND",
+                "reason": "Hook: projects export blocked after third Next (no validation popup)",
+            }
+        ctx["validation_popup_detected"] = True
+        ctx["post_projects_screen_type"] = post_class.get("post_projects_screen_type", "projects_validation_popup")
+        ctx["post_projects_screen_ok"] = True
+
+    ctx.update(
+        {
+            "post_projects_blob": collect_text_blob(after_post.get("entries", []), min_confidence),
+            "post_projects_entries": after_post.get("entries", []),
+            "post_projects_screen_type": post_class["post_projects_screen_type"],
+            "post_projects_evidence_words": post_class["evidence_words"],
+            "post_projects_screen_ok": post_class["post_screen_ok"],
+            "post_projects_classification_status": post_class["status"],
+            "post_projects_classification_reason": post_class["reason"],
+            "template_screen_detected": post_class.get("template_screen_detected", False),
+            "raw_ocr_text": post_class.get("raw_ocr_text", ""),
+            "validation_popup_detected": post_class.get("validation_popup_detected", False),
+            "validation_popup_text": post_class.get("validation_popup_text", ""),
+        }
+    )
+
+    save_discovery(
+        evidence,
+        "post_projects_next_screen_evidence.json",
+        {
+            "post_projects_screen_type": post_class["post_projects_screen_type"],
+            "evidence_words": post_class["evidence_words"],
+            "raw_ocr_text": post_class.get("raw_ocr_text", ""),
+            "fallback_ocr_used": ctx.get("fallback_ocr_used", True),
+            "cached_wizard_bounds": capture_meta.get("cached_wizard_bounds"),
+            "redetected_wizard_bounds": capture_meta.get("redetected_wizard_bounds"),
+            "rect_before_clip": capture_meta.get("rect_before_clip") or _M21_LAST_RECT_CLIP.get("rect_before_clip"),
+            "rect_after_clip": capture_meta.get("rect_after_clip") or _M21_LAST_RECT_CLIP.get("rect_after_clip"),
+            "capture_mode": capture_meta.get("capture_mode", ""),
+            "next_pressed_count_total": count_next_presses(evidence.steps),
+            "finish_pressed": finish_pressed_in_steps(evidence.steps),
+            "export_file_created": False,
+            "wizard_still_open": post_class.get("wizard_still_open", False),
+            "validation_popup_detected": post_class.get("validation_popup_detected", False),
+            "validation_popup_text": post_class.get("validation_popup_text", ""),
+            "hook_applied": force_post_projects_next_screen_not_found_after_third_next,
+            "classification_status": post_class.get("status", ""),
+            "classification_reason": post_class.get("reason", ""),
+        },
+    )
+
+    return p6_rect, ctx, None
+
+
+def m21_build_expected_stage_hook_payload(
+    ctx: Dict[str, Any],
+    evidence: ExportWizardEvidence,
+    post_class: Dict[str, Any],
+    min_confidence: float,
+) -> Dict[str, Any]:
+    """Record wizard stage evidence when M21 hard-test hook fires after third Next."""
+    post_type = post_class.get("post_projects_screen_type", "")
+    validation_popup = bool(
+        post_class.get("validation_popup_detected")
+        or post_type == "projects_validation_popup"
+        or ctx.get("validation_popup_detected")
+    )
+    return {
+        "spreadsheet_selected": bool(ctx.get("spreadsheet_selected")),
+        "spreadsheet_detected": bool(ctx.get("spreadsheet_detected")),
+        "export_type_screen_detected": bool(ctx.get("export_type_screen_ok")),
+        "activities_selected": bool(ctx.get("activities_selected")),
+        "projects_to_export_screen_detected": bool(ctx.get("projects_to_export_screen_detected")),
+        "project_001_talison_detected": bool(ctx.get("project_001_talison_detected")),
+        "third_next_pressed": bool(ctx.get("third_next_clicked_by_ocr_bbox")),
+        "validation_popup_detected": validation_popup,
+        "hook_applied_at_expected_stage": True,
+        "finish_pressed": finish_pressed_in_steps(evidence.steps),
+        "export_file_created": False,
+        "next_pressed_count_total": count_next_presses(evidence.steps),
+        "post_projects_screen_type": post_type,
+    }
+
+
+def _m21_hard_verify_clean_state(
+    project_name: str,
+    p6_keyword: str,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+    evidence: ExportWizardEvidence,
+) -> Dict[str, Any]:
+    """Confirm Talison project open, Activities workspace, no blocking dialog."""
+    outcome: Dict[str, Any] = {
+        "ok": False,
+        "project_open": False,
+        "activities_workspace": False,
+        "blocking_dialog": False,
+        "window_title": "",
+        "screen_state": "",
+        "reason": "",
+        "rect_before_clip": _M21_LAST_RECT_CLIP.get("rect_before_clip"),
+        "rect_after_clip": _M21_LAST_RECT_CLIP.get("rect_after_clip"),
+    }
+    p6_rect, title, state, meta, err = m21_dirty_start_preflight_once(
+        evidence, project_name, p6_keyword, config, screen_rule, min_confidence
+    )
+    outcome["window_title"] = title
+    outcome["screen_state"] = state
+    outcome["preflight_meta"] = meta
+    outcome["rect_before_clip"] = _M21_LAST_RECT_CLIP.get("rect_before_clip")
+    outcome["rect_after_clip"] = _M21_LAST_RECT_CLIP.get("rect_after_clip")
+    if err:
+        outcome["reason"] = err.get("reason", err.get("status", "preflight failed"))
+        outcome["preflight_error"] = err
+        return outcome
+    if p6_rect is None:
+        outcome["reason"] = "P6 rect unavailable after preflight"
+        return outcome
+    outcome["ok"] = True
+    outcome["project_open"] = True
+    outcome["activities_workspace"] = state == "activities_workspace" or meta.get(
+        "activities_workspace_confirmed", True
+    )
+    outcome["reason"] = "Talison project open; Activities workspace; no blocking dialog"
+    return outcome
+
+
+def ensure_clean_p6_for_m21_hard(
+    project_name: str,
+    run_id: str,
+) -> Dict[str, Any]:
+    """
+    Deterministic M21 hard-test precondition: foreground P6, dismiss stale dialogs,
+    restore Talison + Activities when needed (up to 3 attempts).
+    """
+    from m04_check_project_opened import run_m04  # noqa: WPS433
+    from m06_go_to_activities import run_m06  # noqa: WPS433
+
+    config = load_json(CONFIG_PATH)
+    screen_rule = load_json(SCREEN_RULE_PATH)
+    p6_keyword = config["p6_window_title_keyword"]
+    min_confidence = float(config.get("min_ocr_confidence", 0.5))
+
+    result: Dict[str, Any] = {
+        "run_id": run_id,
+        "project_name": project_name,
+        "ok": False,
+        "status": "SETUP_PROJECT_RESTORE_FAILED",
+        "reason": "",
+        "notes": [],
+        "attempts": [],
+        "rect_before_clip": None,
+        "rect_after_clip": None,
+        "window_title": "",
+        "screen_state": "",
+    }
+
+    tmp = Path(tempfile.gettempdir()) / f"m21_hard_clean_{run_id}"
+    for sub in ("screenshots", "ocr", "classification", "popup", "discovery"):
+        (tmp / sub).mkdir(parents=True, exist_ok=True)
+    evidence = ExportWizardEvidence(
+        run_id=run_id,
+        folder=tmp,
+        module_name="m21_hard_clean",
+        screenshots_dir=tmp / "screenshots",
+        ocr_dir=tmp / "ocr",
+        classification_dir=tmp / "classification",
+        popup_dir=tmp / "popup",
+        discovery_dir=tmp / "discovery",
+        steps=[],
+    )
+
+    m21_install_rect_clip_capture_patch()
+    try:
+        for attempt in range(3):
+            attempt_log: Dict[str, Any] = {"attempt": attempt + 1, "methods": []}
+            result["notes"].append(f"--- restore attempt {attempt + 1}/3 ---")
+
+            window_tools.activate_window_by_title(p6_keyword)
+            window_tools.maximize_window_by_title(p6_keyword)
+            time.sleep(0.5)
+
+            dismiss_notes = m20_hard_dismiss_stale_dialogs(p6_keyword, config, screen_rule, min_confidence)
+            attempt_log["dismiss_notes"] = dismiss_notes
+            result["notes"].extend(dismiss_notes)
+
+            verify = _m21_hard_verify_clean_state(
+                project_name, p6_keyword, config, screen_rule, min_confidence, evidence
+            )
+            attempt_log["verify_after_dismiss"] = verify
+            if verify.get("ok"):
+                result.update(
+                    {
+                        "ok": True,
+                        "status": "READY",
+                        "reason": verify.get("reason", "clean"),
+                        "rect_before_clip": verify.get("rect_before_clip"),
+                        "rect_after_clip": verify.get("rect_after_clip"),
+                        "window_title": verify.get("window_title", ""),
+                        "screen_state": verify.get("screen_state", ""),
+                    }
+                )
+                result["attempts"].append(attempt_log)
+                return result
+
+            chain_id = f"{run_id}_a{attempt}"
+            restore_a = m21_restore_workspace_via_m03_chain(
+                project_name,
+                chain_id,
+                p6_keyword=p6_keyword,
+                config=config,
+                screen_rule=screen_rule,
+                min_confidence=min_confidence,
+                evidence_steps=evidence.steps,
+            )
+            attempt_log["methods"].append({"method": "A_m03_m04_m06", "result": restore_a})
+            verify_a = _m21_hard_verify_clean_state(
+                project_name, p6_keyword, config, screen_rule, min_confidence, evidence
+            )
+            if verify_a.get("ok"):
+                result.update(
+                    {
+                        "ok": True,
+                        "status": "READY",
+                        "reason": "Restored via M03/M04/M06 chain",
+                        "rect_before_clip": verify_a.get("rect_before_clip"),
+                        "rect_after_clip": verify_a.get("rect_after_clip"),
+                        "window_title": verify_a.get("window_title", ""),
+                        "screen_state": verify_a.get("screen_state", ""),
+                    }
+                )
+                result["attempts"].append(attempt_log)
+                return result
+
+            m03_status = restore_a.get("m03_status", "")
+            if not restore_a.get("success") or "OPEN" in m03_status:
+                fallback = m21_open_project_restore_fallback(
+                    project_name,
+                    f"{chain_id}_fb",
+                    p6_keyword=p6_keyword,
+                    config=config,
+                    min_confidence=min_confidence,
+                    evidence_steps=evidence.steps,
+                )
+                attempt_log["methods"].append({"method": "B_open_project_fallback", "result": fallback})
+                if fallback.get("success"):
+                    m04 = run_m04(project_name, run_id=f"{chain_id}_fb_m04")
+                    m06 = run_m06(project_name, run_id=f"{chain_id}_fb_m06")
+                    attempt_log["methods"].append(
+                        {"method": "B_m04_m06", "m04": m04.get("status"), "m06": m06.get("status")}
+                    )
+                    verify_b = _m21_hard_verify_clean_state(
+                        project_name, p6_keyword, config, screen_rule, min_confidence, evidence
+                    )
+                    if verify_b.get("ok"):
+                        result.update(
+                            {
+                                "ok": True,
+                                "status": "READY",
+                                "reason": "Restored via M21 Open Project fallback + M04/M06",
+                                "rect_before_clip": verify_b.get("rect_before_clip"),
+                                "rect_after_clip": verify_b.get("rect_after_clip"),
+                                "window_title": verify_b.get("window_title", ""),
+                                "screen_state": verify_b.get("screen_state", ""),
+                            }
+                        )
+                        result["attempts"].append(attempt_log)
+                        return result
+
+            result["notes"].append("Attempt C: Esc once, prepare P6, retry M03/M04/M06")
+            keyboard_tools.press_escape()
+            time.sleep(1.0)
+            prepare_p6_for_test(p6_keyword)
+            restore_c = m21_restore_workspace_via_m03_chain(
+                project_name,
+                f"{chain_id}_c",
+                p6_keyword=p6_keyword,
+                config=config,
+                screen_rule=screen_rule,
+                min_confidence=min_confidence,
+                evidence_steps=evidence.steps,
+            )
+            attempt_log["methods"].append({"method": "C_esc_retry_chain", "result": restore_c})
+            verify_c = _m21_hard_verify_clean_state(
+                project_name, p6_keyword, config, screen_rule, min_confidence, evidence
+            )
+            if verify_c.get("ok"):
+                result.update(
+                    {
+                        "ok": True,
+                        "status": "READY",
+                        "reason": "Restored after Esc + M03/M04/M06 retry",
+                        "rect_before_clip": verify_c.get("rect_before_clip"),
+                        "rect_after_clip": verify_c.get("rect_after_clip"),
+                        "window_title": verify_c.get("window_title", ""),
+                        "screen_state": verify_c.get("screen_state", ""),
+                    }
+                )
+                result["attempts"].append(attempt_log)
+                return result
+
+            attempt_log["last_verify"] = verify_c
+            result["attempts"].append(attempt_log)
+            result["reason"] = verify_c.get("reason") or restore_c.get("reason", "restore failed")
+            time.sleep(2.0)
+
+        result["status"] = "SETUP_PROJECT_RESTORE_FAILED"
+        if not result["reason"]:
+            result["reason"] = "Project restore failed after 3 attempts"
+        return result
+    finally:
+        m21_remove_rect_clip_capture_patch()

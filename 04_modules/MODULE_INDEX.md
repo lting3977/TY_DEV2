@@ -24,6 +24,7 @@
 | M19 | `m19_discover_spreadsheet_export_type_options.py` | **Frozen (STABLE)** | Export Type discovery — OCR export type options after Spreadsheet Next |
 | M20 | `m20_select_activities_export_type_discovery_only.py` | **Frozen (STABLE)** | Activities export discovery — Spreadsheet, Activities, Next twice, post-Activities screen, cancel |
 | M21 | `m21_discover_activity_export_template_screen.py` | **Frozen (STABLE)** | Activity export template discovery — Projects-to-export, third Next, validation/template screen, cancel |
+| M22 | `m22_select_project_on_projects_to_export_discovery_only.py` | **Frozen (STABLE)** | Project selection on Projects-to-export — select 001 Talison 1275, Next once, template screen discovery, cancel |
 
 ## Phase 2 — M03 (Frozen)
 
@@ -596,6 +597,48 @@ TY_TEST_M21_HARD_6.bat
 - Test 05 hook `force_projects_export_blocked_after_third_next` activates only after full wizard path + third Next.
 - Test 06 hook `force_post_projects_next_screen_not_found_after_third_next` activates only after third Next with stage evidence.
 - Shared helpers in `export_wizard_common.py` (M21+ only; M03–M20 frozen).
+
+## Phase 21 — M22
+
+**Command:**
+
+```bat
+python 04_modules\m22_select_project_on_projects_to_export_discovery_only.py --project "Talison 1275"
+```
+
+**Batch test:**
+
+```bat
+TY_TEST_M22_SELECT_PROJECT_ON_PROJECTS_TO_EXPORT.bat
+TY_TEST_M22_HARD_6.bat
+```
+
+**Output:**
+
+`06_output\runs\<run_id>\m22_select_project_on_projects_to_export_discovery_only\`
+
+**Behaviour:** Project selection discovery only. Spreadsheet → Export Type → Activities → Projects-to-export → select 001 Talison 1275 (Export-column checkbox) → Next once → classify post-selection screen (template or partial), then safely cancel. Does not press Finish, edit template, type path, or create export files.
+
+**Status:** STABLE / FROZEN — simple test `20260629_180232`, hard test `20260630_010538` (6/6). Do not modify unless a later module exposes a real shared bug.
+
+**Hard test batch:**
+
+```bat
+TY_TEST_M22_HARD_6.bat
+```
+
+**Notes:**
+
+- Valid PASS statuses: `PASS_PROJECT_SELECTION_NEXT_DISCOVERY`, `PASS_PROJECT_SELECTION_NEXT_DISCOVERY_PARTIAL`.
+- Next pressed exactly 3 times on discovery paths (Spreadsheet/Export Type/Activities + one after project select); wizard closed via Cancel.
+- No Finish pressed; no export files created; no Browse/path/template edit.
+- Hard matrix uses `ensure_clean_p6_for_m22_hard()` — M21 restore chain + neutral mouse inside P6 before each test.
+- Hard matrix skips redundant M22 clean-restore when precheck already restored (`skip_project_restore=True`).
+- PyAutoGUI click/move guarded via `m22_safe_pyautogui_*` — validates P6 bounds, corner margin, catches FailSafeException.
+- Test 04 closes project via M05; expects `FAIL_PROJECT_NOT_OPEN`; post-test restore.
+- Test 05 hook `force_project_row_not_found` activates only after Projects-to-export screen reached.
+- Test 06 hook `force_post_project_selection_screen_not_found` activates only after project selection + Next from Projects-to-export.
+- Shared helpers in `export_wizard_common.py` (M22+ only; M03–M21 frozen).
 
 ## Safety (all modules)
 

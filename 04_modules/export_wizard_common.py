@@ -420,6 +420,63 @@ def try_resolve_stale_close_project_popup(
     return True, "alt+y"
 
 
+M22_TOOLBAR_POPUP_WORDS = frozenset({"remove", "delete", "overwrite", "save"})
+
+
+def m22_hard_prep_false_positive_unsafe(
+    entries: List[Dict[str, Any]],
+    min_confidence: float,
+    reason: str,
+    screen_state: str = "",
+) -> bool:
+    """
+    P6 Activities toolbar/menu OCR often yields remove/delete/save as button labels
+    without a modal Yes/No — not a blocking confirmation popup.
+    """
+    from m16_discover_p6_export_menu import exact_button_labels  # noqa: WPS433
+
+    state = (screen_state or "").lower()
+    if state and state not in (
+        "activities_workspace",
+        "p6_main",
+        "unknown",
+        "wbs_workspace",
+        "projects_workspace",
+    ):
+        return False
+
+    reason_l = (reason or "").lower()
+    if not any(word in reason_l for word in M22_TOOLBAR_POPUP_WORDS):
+        return False
+
+    exact = exact_button_labels(entries, min_confidence)
+    if ("yes" in exact and "no" in exact) or ("ok" in exact and "cancel" in exact):
+        return False
+
+    if reason_l.startswith("unsafe confirmation phrase:"):
+        return state in ("activities_workspace", "p6_main", "unknown", "", "wbs_workspace", "projects_workspace")
+
+    toolbar_hits = exact.intersection(M22_TOOLBAR_POPUP_WORDS)
+    if toolbar_hits and len(exact) >= 3:
+        return True
+    return False
+
+
+def m22_hard_prep_blocking_popup(
+    entries: List[Dict[str, Any]],
+    min_confidence: float,
+    screen_state: str = "",
+) -> Tuple[bool, str]:
+    from m16_discover_p6_export_menu import detect_m16_blocking_popup  # noqa: WPS433
+
+    blocking, block_reason = detect_m16_blocking_popup(entries, min_confidence)
+    if blocking and m22_hard_prep_false_positive_unsafe(
+        entries, min_confidence, block_reason, screen_state
+    ):
+        return False, ""
+    return blocking, block_reason
+
+
 def m20_hard_dismiss_stale_dialogs(
     p6_keyword: str,
     config: Dict[str, Any],
@@ -485,7 +542,9 @@ def m20_hard_dismiss_stale_dialogs(
             p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
             continue
 
-        blocking, block_reason = detect_m16_blocking_popup(entries, min_confidence)
+        blocking, block_reason = m22_hard_prep_blocking_popup(
+            entries, min_confidence, cap.get("screen_state", "")
+        )
         if blocking:
             if is_close_project_confirmation(blob):
                 notes.append(
@@ -1024,29 +1083,39 @@ def m20_preflight_reset_before_export(
     entries = cap["entries"]
 
     if cap.get("unsafe"):
-        resolved, resolve_method = try_resolve_stale_close_project_popup(
-            evidence, p6_rect, entries, min_confidence
-        )
-        if resolved:
-            preflight["stale_close_confirm_resolved"] = resolve_method
-            time.sleep(1.0)
-            p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
-            cap = capture_preflight("preflight_01b_after_close_confirm", p6_rect)
-            if not cap.get("ok"):
-                polluted = cap.get("polluted")
+        if m22_hard_prep_false_positive_unsafe(
+            entries, min_confidence, cap.get("unsafe_reason", ""), screen_state
+        ):
+            evidence.steps.append(
+                f"M20 preflight: ignored toolbar false-positive unsafe ({cap.get('unsafe_reason', '')})"
+            )
+            cap["unsafe"] = False
+        else:
+            resolved, resolve_method = try_resolve_stale_close_project_popup(
+                evidence, p6_rect, entries, min_confidence
+            )
+            if resolved:
+                preflight["stale_close_confirm_resolved"] = resolve_method
+                time.sleep(1.0)
+                p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+                cap = capture_preflight("preflight_01b_after_close_confirm", p6_rect)
+                if not cap.get("ok"):
+                    polluted = cap.get("polluted")
+                    return None, window_title, screen_state, preflight, {
+                        "status": "MANUAL_REVIEW_CANNOT_CONFIRM" if polluted else "FAIL_P6_WINDOW_NOT_READY",
+                        "reason": cap.get("error", "preflight post close-confirm capture failed"),
+                        "manual_review_required": bool(polluted),
+                    }
+                screen_state = cap["screen_state"]
+                entries = cap["entries"]
+            if cap.get("unsafe") and not m22_hard_prep_false_positive_unsafe(
+                entries, min_confidence, cap.get("unsafe_reason", ""), screen_state
+            ):
                 return None, window_title, screen_state, preflight, {
-                    "status": "MANUAL_REVIEW_CANNOT_CONFIRM" if polluted else "FAIL_P6_WINDOW_NOT_READY",
-                    "reason": cap.get("error", "preflight post close-confirm capture failed"),
-                    "manual_review_required": bool(polluted),
+                    "status": "MANUAL_REVIEW_UNSAFE_POPUP",
+                    "reason": cap.get("unsafe_reason", "unsafe popup during preflight"),
+                    "manual_review_required": True,
                 }
-            screen_state = cap["screen_state"]
-            entries = cap["entries"]
-        if cap.get("unsafe"):
-            return None, window_title, screen_state, preflight, {
-                "status": "MANUAL_REVIEW_UNSAFE_POPUP",
-                "reason": cap.get("unsafe_reason", "unsafe popup during preflight"),
-                "manual_review_required": True,
-            }
 
     if open_project_dialog_detected(cap, min_confidence):
         preflight["old_open_project_detected"] = True
@@ -1123,7 +1192,20 @@ def m20_preflight_reset_before_export(
         evidence.steps.append("M20 preflight: not in Activities — navigate via M06-style Alt+P, A")
         navigate_to_activities(evidence)
         p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+        window_tools.activate_window_by_title(p6_keyword)
+        window_tools.maximize_window_by_title(p6_keyword)
+        time.sleep(0.8)
         cap = capture_preflight("preflight_04_activities_confirm", p6_rect)
+        if not cap.get("ok") and cap.get("polluted"):
+            evidence.steps.append(
+                "M20 preflight: pollution on activities confirm — refocus P6 and recapture once"
+            )
+            prepare_p6_for_test(p6_keyword)
+            window_tools.activate_window_by_title(p6_keyword)
+            window_tools.maximize_window_by_title(p6_keyword)
+            time.sleep(1.0)
+            p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+            cap = capture_preflight("preflight_04_activities_confirm_retry", p6_rect)
         if not cap.get("ok"):
             polluted = cap.get("polluted")
             return None, window_title, screen_state, preflight, {
@@ -1139,7 +1221,9 @@ def m20_preflight_reset_before_export(
                 "status": "FAIL_ACTIVITIES_NOT_FOUND",
                 "reason": "Activities workspace not confirmed before File > Export",
             }
-        if cap.get("unsafe"):
+        if cap.get("unsafe") and not m22_hard_prep_false_positive_unsafe(
+            entries, min_confidence, cap.get("unsafe_reason", ""), screen_state
+        ):
             return None, window_title, screen_state, preflight, {
                 "status": "MANUAL_REVIEW_UNSAFE_POPUP",
                 "reason": cap.get("unsafe_reason", "unsafe popup after Activities navigation"),
@@ -4540,6 +4624,1040 @@ def m21_controlled_wizard_to_post_projects_next(
             "classification_reason": post_class.get("reason", ""),
         },
     )
+
+    return p6_rect, ctx, None
+
+
+# --- M22: Projects-to-export project row selection -> post-selection next screen ---
+
+M22_MAX_RUN_SEC = 240
+M22_MAX_WAIT_SEC = 8
+M22_PYAUTOGUI_CORNER_MARGIN = 20
+
+_M22_ORIG_PYAUTO_CLICK: Any = None
+_M22_ORIG_PYAUTO_MOVE: Any = None
+_M22_PYAUTOGUI_GUARD_ACTIVE = False
+_M22_PYAUTOGUI_GUARD_STATE: Dict[str, Any] = {}
+
+
+class M22FailSafeError(Exception):
+    """PyAutoGUI fail-safe triggered during M22 run."""
+
+
+class M22UnsafeClickError(Exception):
+    """Click point rejected by M22 safety validation."""
+
+
+def m22_screen_size() -> Tuple[int, int]:
+    try:
+        import pyautogui  # noqa: WPS433
+
+        size = pyautogui.size()
+        return int(size.width), int(size.height)
+    except Exception:  # noqa: BLE001
+        return 3840, 2160
+
+
+def m22_point_near_screen_corner(sx: int, sy: int, margin: int = M22_PYAUTOGUI_CORNER_MARGIN) -> bool:
+    sw, sh = m22_screen_size()
+    return sx <= margin or sy <= margin or sx >= sw - margin or sy >= sh - margin
+
+
+def m22_validate_click_point(
+    sx: int,
+    sy: int,
+    p6_rect: P6Rect,
+    wizard_bounds: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """Validate screen click is inside P6 and away from screen corners."""
+    inside_p6 = (
+        p6_rect.left + 4 <= sx <= p6_rect.left + p6_rect.width - 4
+        and p6_rect.top + 4 <= sy <= p6_rect.top + p6_rect.height - 4
+    )
+    near_corner = m22_point_near_screen_corner(sx, sy)
+    inside_wizard = True
+    if wizard_bounds:
+        wx0 = int(p6_rect.left + wizard_bounds.get("x_min", 0))
+        wy0 = int(p6_rect.top + wizard_bounds.get("y_min", 0))
+        wx1 = int(p6_rect.left + wizard_bounds.get("x_max", p6_rect.width))
+        wy1 = int(p6_rect.top + wizard_bounds.get("y_max", p6_rect.height))
+        inside_wizard = wx0 <= sx <= wx1 and wy0 <= sy <= wy1
+    safe = inside_p6 and not near_corner
+    reason = ""
+    if near_corner:
+        reason = f"click within {M22_PYAUTOGUI_CORNER_MARGIN}px of screen corner"
+    elif not inside_p6:
+        reason = "click outside P6 window bounds"
+    return {
+        "safe": safe,
+        "inside_p6": inside_p6,
+        "inside_wizard": inside_wizard,
+        "near_corner": near_corner,
+        "click_point": {"x": sx, "y": sy},
+        "reason": reason,
+    }
+
+
+def m22_record_click_evidence(
+    evidence: Optional[ExportWizardEvidence],
+    payload: Dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    if evidence is None:
+        return
+    path = evidence.discovery_dir / "pyautogui_click_safety.json"
+    existing: List[Dict[str, Any]] = []
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            existing = []
+    existing.append({"label": label, **payload})
+    path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def m22_safe_pyautogui_click(
+    sx: int,
+    sy: int,
+    p6_rect: P6Rect,
+    *,
+    wizard_bounds: Optional[Dict[str, float]] = None,
+    evidence: Optional[ExportWizardEvidence] = None,
+    label: str = "click",
+) -> Dict[str, Any]:
+    import pyautogui  # noqa: WPS433
+
+    validation = m22_validate_click_point(sx, sy, p6_rect, wizard_bounds)
+    m22_record_click_evidence(evidence, validation, label=label)
+    if not validation["safe"]:
+        return {"ok": False, "validation": validation, "error": validation["reason"]}
+    try:
+        pyautogui.click(int(sx), int(sy))
+        return {"ok": True, "validation": validation, "click_point": {"x": sx, "y": sy}}
+    except pyautogui.FailSafeException as exc:
+        m22_record_click_evidence(
+            evidence,
+            {"failsafe": True, "error": str(exc), "click_point": {"x": sx, "y": sy}},
+            label=f"{label}_failsafe",
+        )
+        raise M22FailSafeError(str(exc)) from exc
+
+
+def m22_safe_pyautogui_move(
+    sx: int,
+    sy: int,
+    p6_rect: P6Rect,
+    *,
+    evidence: Optional[ExportWizardEvidence] = None,
+    label: str = "move",
+    duration: float = 0.15,
+) -> Dict[str, Any]:
+    import pyautogui  # noqa: WPS433
+
+    validation = m22_validate_click_point(sx, sy, p6_rect, None)
+    m22_record_click_evidence(evidence, validation, label=label)
+    if not validation["safe"]:
+        return {"ok": False, "validation": validation, "error": validation["reason"]}
+    try:
+        pyautogui.moveTo(int(sx), int(sy), duration=max(0.05, duration))
+        return {"ok": True, "validation": validation, "click_point": {"x": sx, "y": sy}}
+    except pyautogui.FailSafeException as exc:
+        m22_record_click_evidence(
+            evidence,
+            {"failsafe": True, "error": str(exc), "click_point": {"x": sx, "y": sy}},
+            label=f"{label}_failsafe",
+        )
+        raise M22FailSafeError(str(exc)) from exc
+
+
+def m22_move_mouse_p6_neutral(
+    p6_rect: P6Rect,
+    *,
+    evidence: Optional[ExportWizardEvidence] = None,
+) -> Dict[str, Any]:
+    """Move mouse to P6 centre (outside wizard chrome) to avoid fail-safe corners."""
+    nx = int(p6_rect.left + p6_rect.width * 0.5)
+    ny = int(p6_rect.top + p6_rect.height * 0.42)
+    result = m22_safe_pyautogui_move(nx, ny, p6_rect, evidence=evidence, label="p6_neutral")
+    if not result.get("ok"):
+        for frac_y in (0.35, 0.5, 0.55):
+            ny = int(p6_rect.top + p6_rect.height * frac_y)
+            result = m22_safe_pyautogui_move(nx, ny, p6_rect, evidence=evidence, label="p6_neutral_retry")
+            if result.get("ok"):
+                break
+    return result
+
+
+def m22_install_pyautogui_guard(
+    get_p6_rect: Any,
+    get_wizard_bounds: Any,
+    evidence: Optional[ExportWizardEvidence] = None,
+) -> None:
+    """Guard pyautogui click/move during M22 runs; does not disable FAILSAFE."""
+    global _M22_ORIG_PYAUTO_CLICK, _M22_ORIG_PYAUTO_MOVE, _M22_PYAUTOGUI_GUARD_ACTIVE
+    import pyautogui  # noqa: WPS433
+
+    if _M22_PYAUTOGUI_GUARD_ACTIVE:
+        return
+    _M22_ORIG_PYAUTO_CLICK = pyautogui.click
+    _M22_ORIG_PYAUTO_MOVE = pyautogui.moveTo
+    _M22_PYAUTOGUI_GUARD_STATE["evidence"] = evidence
+
+    def guarded_click(x: Any, y: Any, *args: Any, **kwargs: Any) -> Any:
+        p6_rect = get_p6_rect()
+        if p6_rect is None:
+            return _M22_ORIG_PYAUTO_CLICK(x, y, *args, **kwargs)
+        sx, sy = int(x), int(y)
+        wb = get_wizard_bounds()
+        validation = m22_validate_click_point(sx, sy, p6_rect, wb)
+        m22_record_click_evidence(evidence, validation, label="guarded_click")
+        if not validation["safe"]:
+            raise M22UnsafeClickError(validation.get("reason", "unsafe click point"))
+        try:
+            return _M22_ORIG_PYAUTO_CLICK(x, y, *args, **kwargs)
+        except pyautogui.FailSafeException as exc:
+            m22_record_click_evidence(
+                evidence,
+                {"failsafe": True, "error": str(exc), "click_point": {"x": sx, "y": sy}},
+                label="guarded_click_failsafe",
+            )
+            raise M22FailSafeError(str(exc)) from exc
+
+    def guarded_move(x: Any, y: Any, *args: Any, **kwargs: Any) -> Any:
+        p6_rect = get_p6_rect()
+        if p6_rect is None:
+            return _M22_ORIG_PYAUTO_MOVE(x, y, *args, **kwargs)
+        sx, sy = int(x), int(y)
+        validation = m22_validate_click_point(sx, sy, p6_rect, None)
+        m22_record_click_evidence(evidence, validation, label="guarded_move")
+        if not validation["safe"]:
+            raise M22UnsafeClickError(validation.get("reason", "unsafe move point"))
+        try:
+            return _M22_ORIG_PYAUTO_MOVE(x, y, *args, **kwargs)
+        except pyautogui.FailSafeException as exc:
+            raise M22FailSafeError(str(exc)) from exc
+
+    pyautogui.click = guarded_click
+    pyautogui.moveTo = guarded_move
+    _M22_PYAUTOGUI_GUARD_ACTIVE = True
+
+
+def m22_remove_pyautogui_guard() -> None:
+    global _M22_ORIG_PYAUTO_CLICK, _M22_ORIG_PYAUTO_MOVE, _M22_PYAUTOGUI_GUARD_ACTIVE
+    if not _M22_PYAUTOGUI_GUARD_ACTIVE:
+        return
+    import pyautogui  # noqa: WPS433
+
+    if _M22_ORIG_PYAUTO_CLICK is not None:
+        pyautogui.click = _M22_ORIG_PYAUTO_CLICK
+    if _M22_ORIG_PYAUTO_MOVE is not None:
+        pyautogui.moveTo = _M22_ORIG_PYAUTO_MOVE
+    _M22_PYAUTOGUI_GUARD_ACTIVE = False
+
+
+def ensure_clean_p6_for_m22_hard(project_name: str, run_id: str) -> Dict[str, Any]:
+    """M22 hard-test precondition: M21 restore chain + neutral mouse inside P6."""
+    result = ensure_clean_p6_for_m21_hard(project_name, run_id)
+    if not result.get("ok"):
+        return result
+    try:
+        from hand.p6_prepare import prepare_p6_for_test  # noqa: WPS433
+
+        config = load_json(CONFIG_PATH)
+        p6_keyword = config["p6_window_title_keyword"]
+        prep = prepare_p6_for_test(p6_keyword)
+        if prep.get("success") and prep.get("rect"):
+            move = m22_move_mouse_p6_neutral(prep["rect"])
+            result["mouse_neutral"] = move
+            if not move.get("ok"):
+                result["notes"] = list(result.get("notes", []))
+                result["notes"].append(f"mouse neutral skipped: {move.get('error', 'unsafe point')}")
+    except M22FailSafeError as exc:
+        result["pyautogui_failsafe"] = True
+        result["notes"] = list(result.get("notes", []))
+        result["notes"].append(f"mouse neutral failsafe: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        result["notes"] = list(result.get("notes", []))
+        result["notes"].append(f"mouse neutral error: {exc}")
+    return result
+
+
+M22_PROJECT_ROW_SKIP = frozenset(
+    {
+        "next",
+        "back",
+        "cancel",
+        "finish",
+        "browse",
+        "ok",
+        "project",
+        "projects",
+        "export",
+        "open",
+        "open projects",
+        "projects to export",
+        "export project",
+    }
+)
+
+
+def entry_center_in_wizard_bounds(entry: Dict[str, Any], bounds: Dict[str, float]) -> bool:
+    cx, cy = bbox_center(entry)
+    return (
+        bounds.get("x_min", 0.0) <= cx <= bounds.get("x_max", 99999.0)
+        and bounds.get("y_min", 0.0) <= cy <= bounds.get("y_max", 99999.0)
+    )
+
+
+def _m22_row_center_y(entry: Dict[str, Any]) -> float:
+    ys = [p[1] for p in entry.get("bbox", [[0, 0]])]
+    return sum(ys) / len(ys)
+
+
+def _m22_is_project_id_001_entry(norm: str) -> bool:
+    if not norm:
+        return False
+    compact = re.sub(r"\s+", "", norm)
+    if compact in ("001", "1"):
+        return True
+    return bool(re.fullmatch(r"0*1{1,3}", compact)) or (
+        bool(re.search(r"\b001\b", norm)) and len(norm) <= 8
+    )
+
+
+def score_m22_project_row_entry(norm: str, project_name: str) -> float:
+    if not norm:
+        return 0.0
+    if norm in M22_PROJECT_ROW_SKIP:
+        return 0.0
+    if any(skip in norm for skip in ("projects to export", "open projects", "export project")):
+        return 0.0
+    if norm in ("next", "back", "cancel", "finish", "browse"):
+        return 0.0
+    pn = normalize_text(project_name)
+    has_001 = _m22_is_project_id_001_entry(norm)
+    has_talison = "talison" in norm or "talizon" in norm or "1275" in norm
+    for token in pn.replace("-", " ").split():
+        tok = normalize_text(token)
+        if len(tok) >= 3 and tok in norm:
+            has_talison = True
+    score = 0.0
+    if has_001 and has_talison:
+        score = 32.0
+    elif has_talison and len(norm) >= 8:
+        score = 22.0
+    elif has_001:
+        score = 18.0
+    if ("talison" in norm or "talizon" in norm) and has_001:
+        score += 4.0
+    return score
+
+
+def find_project_row_on_projects_to_export(
+    entries: List[Dict[str, Any]],
+    project_name: str,
+    min_confidence: float,
+    wizard_bounds: Dict[str, float],
+) -> Tuple[Optional[Dict[str, Any]], str, float, Optional[Dict[str, Any]]]:
+    """Return click target (prefer 001 id/checkbox column) paired with project name row."""
+    row_threshold = min(min_confidence, 0.45)
+    id_entries: List[Dict[str, Any]] = []
+    name_candidates: List[Tuple[Dict[str, Any], float, str]] = []
+
+    for entry in entries:
+        if entry.get("confidence", 0) < row_threshold:
+            continue
+        norm = entry.get("normalized", "")
+        cy = _m22_row_center_y(entry)
+        if cy > wizard_bounds.get("y_max", 950.0) - 70:
+            continue
+        if cy < wizard_bounds.get("y_min", 0.0) + 50:
+            continue
+        if not entry_center_in_wizard_bounds(entry, wizard_bounds):
+            continue
+        if _m22_is_project_id_001_entry(norm):
+            id_entries.append(entry)
+            continue
+        score = score_m22_project_row_entry(norm, project_name)
+        if score >= 10.0:
+            name_candidates.append((entry, score, entry.get("text", norm)))
+
+    best_click: Optional[Dict[str, Any]] = None
+    best_name_entry: Optional[Dict[str, Any]] = None
+    best_score = 0.0
+    best_text = ""
+    y_tol = 20.0
+
+    for id_entry in id_entries:
+        id_y = _m22_row_center_y(id_entry)
+        for name_entry, name_score, name_text in name_candidates:
+            if abs(id_y - _m22_row_center_y(name_entry)) > y_tol:
+                continue
+            pair_score = 42.0 + name_score
+            display = f"001 {name_text}".strip()
+            if pair_score > best_score:
+                best_click = id_entry
+                best_name_entry = name_entry
+                best_score = pair_score
+                best_text = display
+
+    if best_click is not None:
+        return best_click, best_text, best_score, best_name_entry
+
+    for name_entry, name_score, name_text in name_candidates:
+        if name_score > best_score:
+            best_click = name_entry
+            best_name_entry = name_entry
+            best_score = name_score
+            best_text = name_text
+
+    if best_click is None:
+        for entry in entries:
+            if entry.get("confidence", 0) < row_threshold:
+                continue
+            norm = entry.get("normalized", "")
+            score = score_m22_project_row_entry(norm, project_name)
+            if score <= 0:
+                continue
+            _, cy = bbox_center(entry)
+            if cy > wizard_bounds.get("y_max", 950.0) - 70:
+                score *= 0.08
+            if cy < wizard_bounds.get("y_min", 0.0) + 50:
+                score *= 0.2
+            if not entry_center_in_wizard_bounds(entry, wizard_bounds):
+                score *= 0.05
+            if score > best_score:
+                best_click = entry
+                best_name_entry = entry
+                best_score = score
+                best_text = entry.get("text", norm)
+
+    return best_click, best_text, best_score, best_name_entry
+
+
+def m22_find_export_checkbox_x(
+    entries: List[Dict[str, Any]],
+    row_entry: Dict[str, Any],
+    wizard_bounds: Dict[str, float],
+    min_confidence: float,
+) -> float:
+    """Export-column checkbox x for a project row (left of Project ID)."""
+    row_y = _m22_row_center_y(row_entry)
+    threshold = min(min_confidence, 0.45)
+    best_x: Optional[float] = None
+    best_dy = 9999.0
+    for entry in entries:
+        if entry.get("confidence", 0) < threshold:
+            continue
+        norm = entry.get("normalized", "")
+        if norm != "export":
+            continue
+        _, cy = bbox_center(entry)
+        if cy >= row_y - 8:
+            continue
+        dy = row_y - cy
+        if dy > 120.0:
+            continue
+        if dy < best_dy:
+            xs = [p[0] for p in entry["bbox"]]
+            best_x = min(xs) + 12.0
+            best_dy = dy
+    if best_x is not None:
+        return best_x
+
+    xs = [p[0] for p in row_entry["bbox"]]
+    id_left = min(xs)
+    return max(wizard_bounds.get("x_min", 0.0) + 36.0, id_left - 88.0)
+
+
+def m22_click_project_row_safe(
+    p6_rect: P6Rect,
+    entry: Dict[str, Any],
+    wizard_bounds: Dict[str, float],
+    *,
+    name_entry: Optional[Dict[str, Any]] = None,
+    list_entries: Optional[List[Dict[str, Any]]] = None,
+    min_confidence: float = 0.5,
+    strategy: str = "export_checkbox",
+    evidence: Optional[ExportWizardEvidence] = None,
+) -> Dict[str, Any]:
+    """Click Export-column checkbox for confirmed project row inside wizard bounds."""
+    from accessibility.hand import keyboard_tools
+    from m16_discover_p6_export_menu import click_ocr_entry
+
+    norm = entry.get("normalized", "")
+    xs = [p[0] for p in entry["bbox"]]
+    ys = [p[1] for p in entry["bbox"]]
+    cx = sum(xs) / len(xs)
+    cy = sum(ys) / len(ys)
+
+    if strategy == "name_focus_export" and name_entry is not None:
+        click_ocr_entry(p6_rect, name_entry)
+        time.sleep(0.35)
+
+    if list_entries:
+        click_x = m22_find_export_checkbox_x(list_entries, entry, wizard_bounds, min_confidence)
+        click_target = f"export_column_checkbox_{strategy}"
+    elif _m22_is_project_id_001_entry(norm):
+        click_x = cx
+        click_target = "001_checkbox"
+    elif name_entry is not None:
+        name_xs = [p[0] for p in name_entry["bbox"]]
+        click_x = min(name_xs) - 55.0
+        click_target = "project_row_left"
+    else:
+        width = max(xs) - min(xs)
+        click_x = min(xs) + min(max(18.0, width * 0.12), width * 0.35)
+        click_target = "project_row"
+
+    x_min = wizard_bounds.get("x_min", 0.0) + 12.0
+    x_max = wizard_bounds.get("x_max", float(p6_rect.width)) - 12.0
+    click_x = max(x_min, min(click_x, x_max))
+    click_y = max(
+        wizard_bounds.get("y_min", 0.0) + 8.0,
+        min(cy, wizard_bounds.get("y_max", 950.0) - 8.0),
+    )
+    sx = int(p6_rect.left + click_x)
+    sy = int(p6_rect.top + click_y)
+    click_result = m22_safe_pyautogui_click(
+        sx, sy, p6_rect, wizard_bounds=wizard_bounds, evidence=evidence, label="project_row_checkbox"
+    )
+    if not click_result.get("ok"):
+        raise M22UnsafeClickError(click_result.get("error", "unsafe project row click"))
+    time.sleep(0.25)
+    keyboard_tools.press_key("space")
+    time.sleep(0.45)
+    return {
+        "x": sx,
+        "y": sy,
+        "row_cx": int(p6_rect.left + cx),
+        "row_cy": int(p6_rect.top + cy),
+        "click_target": click_target,
+        "strategy": strategy,
+        "click_validation": click_result.get("validation"),
+    }
+
+
+def classify_post_project_selection_next_screen(
+    entries: List[Dict[str, Any]],
+    min_confidence: float,
+) -> Dict[str, Any]:
+    """Classify wizard screen after project row selection + Next (M22 path)."""
+    validation_hit, validation_norm = m21_validation_popup_in_entries(entries, min_confidence)
+    if validation_hit:
+        blob_low = m21_collect_low_conf_blob(entries, min_confidence)
+        words = sorted(
+            set(
+                collect_post_activities_marker_words(blob_low, M21_PROJECTS_TO_EXPORT_MARKERS)
+                + ["select one or more projects", "ok"]
+            )
+        )
+        return {
+            "post_project_selection_screen_type": "projects_validation_popup",
+            "evidence_words": words,
+            "raw_ocr_text": blob_low[:4000],
+            "post_screen_ok": False,
+            "wizard_still_open": True,
+            "template_screen_detected": False,
+            "status": "FAIL_PROJECT_SELECTION_NOT_CONFIRMED",
+            "reason": "Validation popup after project selection Next — project row not selected",
+            "validation_popup_detected": True,
+            "validation_popup_text": m21_extract_validation_popup_text(blob_low) or validation_norm[:200],
+        }
+
+    post = classify_post_projects_next_screen(entries, min_confidence)
+    screen_type = post.get("post_projects_screen_type", "unknown")
+    status = post.get("status", "")
+    if screen_type == "projects_validation_popup":
+        return {
+            "post_project_selection_screen_type": "projects_validation_popup",
+            "evidence_words": post.get("evidence_words", []),
+            "raw_ocr_text": post.get("raw_ocr_text", ""),
+            "post_screen_ok": False,
+            "wizard_still_open": True,
+            "template_screen_detected": False,
+            "status": "FAIL_PROJECT_SELECTION_NOT_CONFIRMED",
+            "reason": "Validation popup after project selection Next",
+            "validation_popup_detected": True,
+            "validation_popup_text": post.get("validation_popup_text", ""),
+        }
+    if screen_type == "template":
+        return {
+            "post_project_selection_screen_type": "template",
+            "evidence_words": post.get("evidence_words", []),
+            "raw_ocr_text": post.get("raw_ocr_text", ""),
+            "post_screen_ok": True,
+            "wizard_still_open": post.get("wizard_still_open", True),
+            "template_screen_detected": True,
+            "status": "PASS_PROJECT_SELECTION_NEXT_DISCOVERY",
+            "reason": "Template screen discovered after project selection Next",
+            "validation_popup_detected": False,
+        }
+    if screen_type == "file_path":
+        return {
+            "post_project_selection_screen_type": "file_path",
+            "evidence_words": post.get("evidence_words", []),
+            "raw_ocr_text": post.get("raw_ocr_text", ""),
+            "post_screen_ok": True,
+            "wizard_still_open": post.get("wizard_still_open", True),
+            "template_screen_detected": False,
+            "status": "PASS_PROJECT_SELECTION_NEXT_DISCOVERY",
+            "reason": "File/path screen discovered after project selection Next",
+            "validation_popup_detected": False,
+        }
+    if screen_type == "generic_wizard" and post.get("post_screen_ok"):
+        return {
+            "post_project_selection_screen_type": "generic_wizard",
+            "evidence_words": post.get("evidence_words", []),
+            "raw_ocr_text": post.get("raw_ocr_text", ""),
+            "post_screen_ok": True,
+            "wizard_still_open": post.get("wizard_still_open", True),
+            "template_screen_detected": False,
+            "status": "PASS_PROJECT_SELECTION_NEXT_DISCOVERY_PARTIAL",
+            "reason": "Partial post-project-selection wizard discovery",
+            "validation_popup_detected": False,
+        }
+    if post.get("wizard_still_open") and post.get("post_screen_ok"):
+        return {
+            "post_project_selection_screen_type": screen_type,
+            "evidence_words": post.get("evidence_words", []),
+            "raw_ocr_text": post.get("raw_ocr_text", ""),
+            "post_screen_ok": True,
+            "wizard_still_open": True,
+            "template_screen_detected": post.get("template_screen_detected", False),
+            "status": "PASS_PROJECT_SELECTION_NEXT_DISCOVERY",
+            "reason": post.get("reason", "Post-project-selection screen discovered"),
+            "validation_popup_detected": False,
+        }
+    return {
+        "post_project_selection_screen_type": screen_type,
+        "evidence_words": post.get("evidence_words", []),
+        "raw_ocr_text": post.get("raw_ocr_text", ""),
+        "post_screen_ok": False,
+        "wizard_still_open": post.get("wizard_still_open", False),
+        "template_screen_detected": False,
+        "status": "FAIL_POST_PROJECT_SELECTION_SCREEN_NOT_FOUND",
+        "reason": post.get("reason", "Post-project-selection next screen not classified"),
+        "validation_popup_detected": False,
+    }
+
+
+def m22_build_expected_stage_hook_payload(
+    ctx: Dict[str, Any],
+    evidence: ExportWizardEvidence,
+    post_class: Dict[str, Any],
+) -> Dict[str, Any]:
+    screen_type = post_class.get("post_project_selection_screen_type") or post_class.get(
+        "post_projects_screen_type", ""
+    )
+    return {
+        "spreadsheet_selected": bool(ctx.get("spreadsheet_selected")),
+        "spreadsheet_detected": bool(ctx.get("spreadsheet_detected")),
+        "export_type_screen_detected": bool(ctx.get("export_type_screen_ok")),
+        "activities_selected": bool(ctx.get("activities_selected")),
+        "projects_to_export_screen_detected": bool(ctx.get("projects_to_export_screen_detected")),
+        "project_001_talison_detected": bool(ctx.get("project_001_talison_detected")),
+        "project_row_detected": bool(ctx.get("project_row_detected")),
+        "project_row_selected": bool(ctx.get("project_row_selected")),
+        "project_selection_attempted": bool(ctx.get("project_selection_attempted")),
+        "project_selection_next_clicked": bool(ctx.get("project_selection_next_clicked")),
+        "next_from_projects_pressed": bool(ctx.get("project_selection_next_clicked")),
+        "hook_applied_at_expected_stage": True,
+        "finish_pressed": finish_pressed_in_steps(evidence.steps),
+        "export_file_created": False,
+        "next_pressed_count_total": count_next_presses(evidence.steps),
+        "post_project_selection_screen_type": screen_type,
+        "validation_popup_detected": bool(post_class.get("validation_popup_detected")),
+    }
+
+
+def m22_controlled_wizard_to_post_project_selection_next(
+    evidence: ExportWizardEvidence,
+    p6_keyword: str,
+    p6_rect: P6Rect,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+    project_name: str = "",
+    *,
+    force_skip_project_row_select: bool = False,
+    force_project_row_not_found: bool = False,
+    force_post_project_selection_screen_not_found: bool = False,
+) -> Tuple[P6Rect, Dict[str, Any], Optional[Dict[str, Any]]]:
+    """M22: Spreadsheet -> Export Type -> Activities -> Projects-to-export -> select row -> Next."""
+    p6_rect, ctx, err = m20_controlled_wizard_to_post_activities(
+        evidence,
+        p6_keyword,
+        p6_rect,
+        config,
+        screen_rule,
+        min_confidence,
+        project_name,
+    )
+    if err:
+        return p6_rect, ctx, err
+
+    post_entries = ctx.get("post_activities_entries") or ctx.get("export_type_entries", [])
+    projects_class = classify_projects_to_export_screen(post_entries, min_confidence, project_name=project_name)
+    ctx["projects_to_export_screen_detected"] = projects_class["projects_to_export_screen_detected"]
+    ctx["project_001_talison_detected"] = projects_class["project_001_talison_detected"]
+    ctx["projects_to_export_evidence_words"] = projects_class["evidence_words"]
+
+    save_discovery(
+        evidence,
+        "projects_to_export_screen_evidence.json",
+        m20_build_step_evidence(
+            entry=None,
+            p6_rect=p6_rect,
+            cap={"entries": post_entries, "screen_state": "projects_to_export"},
+            pollution_meta={
+                "pollution_detected": ctx.get("pollution_detected", False),
+                "pollution_recovered": ctx.get("pollution_recovered", False),
+                "pollution_words": ctx.get("pollution_words", []),
+            },
+            p6_keyword=p6_keyword,
+            extra={
+                "projects_to_export_screen_detected": projects_class["projects_to_export_screen_detected"],
+                "project_001_talison_detected": projects_class["project_001_talison_detected"],
+                "evidence_words": projects_class["evidence_words"],
+                "next_pressed_count_before_project_select": count_next_presses(evidence.steps),
+            },
+        ),
+    )
+
+    if not projects_class["projects_to_export_screen_detected"]:
+        return p6_rect, ctx, {
+            "status": "FAIL_PROJECTS_TO_EXPORT_SCREEN_NOT_FOUND",
+            "reason": projects_class["reason"],
+        }
+    if not projects_class["project_001_talison_detected"]:
+        return p6_rect, ctx, {
+            "status": "FAIL_PROJECT_ROW_NOT_FOUND",
+            "reason": "001/Talison 1275 not visible on Projects-to-export screen",
+        }
+
+    wizard_bounds = ctx.get("wizard_bounds") or detect_export_wizard_bounds(
+        post_entries, min_confidence, p6_rect.width, p6_rect.height
+    )
+    ctx["wizard_bounds"] = wizard_bounds
+
+    projects_cap, p6_rect, pol_proj, err_proj = m20_step_capture(
+        evidence,
+        "07a_projects_to_export_confirm",
+        p6_rect,
+        p6_keyword,
+        config,
+        screen_rule,
+        min_confidence,
+        wizard_bounds=wizard_bounds,
+    )
+    if err_proj:
+        return p6_rect, ctx, err_proj
+    row_entries = projects_cap.get("entries", post_entries)
+
+    if force_project_row_not_found:
+        evidence.steps.append("Hook: force_project_row_not_found after Projects-to-export screen")
+        ctx["project_row_detected"] = False
+        ctx["forced_hook_activation"] = m22_build_expected_stage_hook_payload(
+            ctx,
+            evidence,
+            {"post_project_selection_screen_type": "", "validation_popup_detected": False},
+        )
+        ctx["forced_hook_activation"]["hook_applied_at_expected_stage"] = True
+        ctx["forced_hook_activation"]["project_row_detected"] = False
+        save_discovery(evidence, "forced_hook_activation.json", ctx["forced_hook_activation"])
+        return p6_rect, ctx, {
+            "status": "FAIL_PROJECT_ROW_NOT_FOUND",
+            "reason": "Hook: force_project_row_not_found after Projects-to-export screen",
+        }
+
+    row_entry, row_text, row_score, name_entry = find_project_row_on_projects_to_export(
+        row_entries, project_name, min_confidence, wizard_bounds
+    )
+    if row_entry is None or row_score < 10.0:
+        return p6_rect, ctx, {
+            "status": "FAIL_PROJECT_ROW_NOT_FOUND",
+            "reason": "Could not confirm 001 Talison 1275 project row bbox on Projects-to-export screen",
+        }
+
+    ctx["project_row_detected"] = True
+    ctx["project_row_text"] = row_text
+    save_discovery(
+        evidence,
+        "project_row_selection_evidence.json",
+        m20_build_step_evidence(
+            entry=row_entry,
+            p6_rect=p6_rect,
+            cap={"entries": post_entries, "screen_state": "projects_to_export"},
+            pollution_meta={},
+            p6_keyword=p6_keyword,
+            extra={
+                "project_row_text": row_text,
+                "project_row_score": row_score,
+                "wizard_bounds": wizard_bounds,
+                "action": "before_project_row_click",
+                "click_target_entry": row_entry.get("text", "") if row_entry else "",
+                "paired_name_entry": name_entry.get("text", "") if name_entry else "",
+            },
+        ),
+    )
+
+    blocking, block_reason = detect_m16_blocking_popup(row_entries, min_confidence)
+    if blocking:
+        return p6_rect, ctx, {"status": "MANUAL_REVIEW_UNSAFE_POPUP", "reason": block_reason}
+
+    strategies = ("export_checkbox", "name_focus_export")
+    post_class: Dict[str, Any] = {}
+    after_next: Dict[str, Any] = {}
+    capture_meta: Dict[str, Any] = {}
+    click_pt: Dict[str, Any] = {}
+    after_row = projects_cap
+    pol_row: Dict[str, Any] = pol_proj
+
+    if force_skip_project_row_select:
+        evidence.steps.append("Hook: force_skip_project_row_select — Next without project row select")
+    else:
+        for attempt_idx, strategy in enumerate(strategies):
+            if attempt_idx > 0:
+                evidence.steps.append(f"M22: project row select retry strategy={strategy}")
+                m21_dismiss_projects_validation_popup(
+                    evidence,
+                    p6_rect,
+                    p6_keyword,
+                    config,
+                    screen_rule,
+                    min_confidence,
+                    None,
+                )
+                recapture, p6_rect, pol_retry, err_retry = m20_step_capture(
+                    evidence,
+                    f"07a_projects_retry_{attempt_idx}",
+                    p6_rect,
+                    p6_keyword,
+                    config,
+                    screen_rule,
+                    min_confidence,
+                    wizard_bounds=wizard_bounds,
+                )
+                if err_retry:
+                    return p6_rect, ctx, err_retry
+                row_entries = recapture.get("entries", row_entries)
+                row_entry, row_text, row_score, name_entry = find_project_row_on_projects_to_export(
+                    row_entries, project_name, min_confidence, wizard_bounds
+                )
+                if row_entry is None or row_score < 10.0:
+                    break
+                pol_row = pol_retry
+
+            evidence.steps.append(
+                f"M22: safe project row select '{row_text[:60]}' strategy={strategy}"
+            )
+            click_pt = m22_click_project_row_safe(
+                p6_rect,
+                row_entry,
+                wizard_bounds,
+                name_entry=name_entry,
+                list_entries=row_entries,
+                min_confidence=min_confidence,
+                strategy=strategy,
+                evidence=evidence,
+            )
+            ctx["project_selection_attempted"] = True
+            time.sleep(min(M22_MAX_WAIT_SEC, 1.0))
+            p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+
+            after_row, p6_rect, pol_row, err_row = m20_step_capture(
+                evidence,
+                f"07b_after_project_row_select_{attempt_idx}",
+                p6_rect,
+                p6_keyword,
+                config,
+                screen_rule,
+                min_confidence,
+                wizard_bounds=wizard_bounds,
+            )
+            if err_row:
+                return p6_rect, ctx, err_row
+
+            row_entries_after = after_row.get("entries", row_entries)
+            next_entry, bounds = find_wizard_next_button(row_entries_after, min_confidence)
+            if next_entry is None:
+                next_entry = find_next_entry(row_entries_after, min_confidence)
+                if next_entry and not next_in_wizard_bounds(
+                    next_entry, bounds or estimate_wizard_bounds(row_entries, min_confidence)
+                ):
+                    return p6_rect, ctx, {
+                        "status": "MANUAL_REVIEW_CANNOT_CONFIRM",
+                        "reason": "Next button bbox not inside wizard bounds after project row select",
+                    }
+            if next_entry is None:
+                return p6_rect, ctx, {
+                    "status": "MANUAL_REVIEW_CANNOT_CONFIRM",
+                    "reason": "Next button not detected on Projects-to-export after project row select",
+                }
+
+            blocking2, block_reason2 = detect_m16_blocking_popup(row_entries_after, min_confidence)
+            if blocking2:
+                return p6_rect, ctx, {"status": "MANUAL_REVIEW_UNSAFE_POPUP", "reason": block_reason2}
+
+            evidence.steps.append(
+                "press Next once: OCR-confirmed Next click (from Projects-to-export after project select)"
+            )
+            click_ocr_entry(p6_rect, next_entry)
+            ctx["project_selection_next_clicked"] = True
+            time.sleep(min(M22_MAX_WAIT_SEC, 1.5))
+            p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+
+            after_next, p6_rect, capture_meta = m21_capture_after_projects_next(
+                evidence,
+                p6_keyword,
+                p6_rect,
+                config,
+                screen_rule,
+                min_confidence,
+                cached_bounds=wizard_bounds,
+            )
+            if not after_next.get("ok"):
+                return p6_rect, ctx, {
+                    "status": "FAIL_P6_WINDOW_NOT_READY",
+                    "reason": capture_meta.get("capture_error", "capture failed after project selection Next"),
+                }
+
+            post_class = classify_post_project_selection_next_screen(after_next["entries"], min_confidence)
+            if not post_class.get("validation_popup_detected"):
+                break
+
+    if force_skip_project_row_select:
+        row_entries_after = row_entries
+        next_entry, bounds = find_wizard_next_button(row_entries_after, min_confidence)
+        if next_entry is None:
+            next_entry = find_next_entry(row_entries_after, min_confidence)
+        if next_entry is None:
+            return p6_rect, ctx, {
+                "status": "MANUAL_REVIEW_CANNOT_CONFIRM",
+                "reason": "Next button not detected for skip-project-row hook",
+            }
+        evidence.steps.append(
+            "press Next once: OCR-confirmed Next click (hook skip project row select)"
+        )
+        click_ocr_entry(p6_rect, next_entry)
+        ctx["project_selection_next_clicked"] = True
+        time.sleep(min(M22_MAX_WAIT_SEC, 1.5))
+        p6_rect = refresh_p6_rect(p6_keyword, p6_rect)
+        after_next, p6_rect, capture_meta = m21_capture_after_projects_next(
+            evidence,
+            p6_keyword,
+            p6_rect,
+            config,
+            screen_rule,
+            min_confidence,
+            cached_bounds=wizard_bounds,
+        )
+        if not after_next.get("ok"):
+            return p6_rect, ctx, {
+                "status": "FAIL_P6_WINDOW_NOT_READY",
+                "reason": capture_meta.get("capture_error", "capture failed after hook Next"),
+            }
+        post_class = classify_post_project_selection_next_screen(after_next["entries"], min_confidence)
+        ctx["forced_hook_activation"] = m22_build_expected_stage_hook_payload(ctx, evidence, post_class)
+        save_discovery(evidence, "forced_hook_activation.json", ctx["forced_hook_activation"])
+
+    if force_post_project_selection_screen_not_found and not post_class.get("validation_popup_detected"):
+        evidence.steps.append("Hook: force_post_project_selection_screen_not_found after project selection Next")
+        ctx["forced_hook_activation"] = m22_build_expected_stage_hook_payload(ctx, evidence, post_class)
+        ctx["forced_hook_activation"]["hook_applied_after_project_selection_next"] = True
+        save_discovery(evidence, "forced_hook_activation.json", ctx["forced_hook_activation"])
+        post_class = {
+            "post_project_selection_screen_type": "unknown",
+            "evidence_words": [],
+            "raw_ocr_text": post_class.get("raw_ocr_text", "")[:4000],
+            "post_screen_ok": False,
+            "wizard_still_open": True,
+            "template_screen_detected": False,
+            "status": "FAIL_POST_PROJECT_SELECTION_SCREEN_NOT_FOUND",
+            "reason": "Hook: force_post_project_selection_screen_not_found",
+            "validation_popup_detected": False,
+        }
+
+    row_entries_after = after_row.get("entries", row_entries)
+    validation_on_row, _ = m21_validation_popup_in_entries(row_entries_after, min_confidence)
+    ctx["project_row_selected"] = (
+        not validation_on_row
+        and not post_class.get("validation_popup_detected")
+        and row_score >= 40.0
+    )
+    save_discovery(
+        evidence,
+        "project_row_selection_evidence.json",
+        {
+            **m20_build_step_evidence(
+                entry=row_entry,
+                p6_rect=p6_rect,
+                cap=after_row,
+                pollution_meta=pol_row,
+                p6_keyword=p6_keyword,
+                extra={
+                    "project_row_text": row_text,
+                    "project_row_score": row_score,
+                    "project_row_selected": ctx["project_row_selected"],
+                    "project_selection_attempted": True,
+                    "click_point": click_pt,
+                    "action": "after_project_row_click",
+                    "selection_strategies_tried": (
+                        []
+                        if force_skip_project_row_select
+                        else list(strategies[: attempt_idx + 1])
+                    ),
+                },
+            ),
+        },
+    )
+
+    ctx["post_selection_capture_meta"] = capture_meta
+    ctx["fallback_ocr_used"] = capture_meta.get("fallback_ocr_used", True)
+    ctx.update(
+        {
+            "post_project_selection_blob": collect_text_blob(after_next["entries"], min_confidence),
+            "post_project_selection_entries": after_next["entries"],
+            "post_project_selection_screen_type": post_class["post_project_selection_screen_type"],
+            "post_project_selection_evidence_words": post_class["evidence_words"],
+            "post_project_selection_screen_ok": post_class["post_screen_ok"],
+            "post_project_selection_classification_status": post_class["status"],
+            "post_project_selection_classification_reason": post_class["reason"],
+            "validation_popup_detected_after_project_selection": post_class.get("validation_popup_detected", False),
+            "template_screen_detected": post_class.get("template_screen_detected", False),
+        }
+    )
+
+    save_discovery(
+        evidence,
+        "post_project_selection_next_screen_evidence.json",
+        {
+            "post_project_selection_screen_type": post_class["post_project_selection_screen_type"],
+            "evidence_words": post_class["evidence_words"],
+            "raw_ocr_text": post_class.get("raw_ocr_text", ""),
+            "project_row_text": row_text,
+            "project_row_selected": ctx.get("project_row_selected"),
+            "project_selection_attempted": ctx.get("project_selection_attempted"),
+            "next_pressed_count_total": count_next_presses(evidence.steps),
+            "finish_pressed": finish_pressed_in_steps(evidence.steps),
+            "validation_popup_detected": post_class.get("validation_popup_detected", False),
+            "classification_status": post_class.get("status", ""),
+            "classification_reason": post_class.get("reason", ""),
+        },
+    )
+
+    if post_class["status"] == "FAIL_PROJECT_SELECTION_NOT_CONFIRMED":
+        return p6_rect, ctx, {
+            "status": "FAIL_PROJECT_SELECTION_NOT_CONFIRMED",
+            "reason": post_class.get("reason", "Project selection not confirmed"),
+        }
+    if post_class["status"] == "FAIL_POST_PROJECT_SELECTION_SCREEN_NOT_FOUND":
+        return p6_rect, ctx, {
+            "status": "FAIL_POST_PROJECT_SELECTION_SCREEN_NOT_FOUND",
+            "reason": post_class.get("reason", "Post-project-selection screen not found"),
+        }
 
     return p6_rect, ctx, None
 

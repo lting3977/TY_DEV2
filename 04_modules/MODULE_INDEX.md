@@ -640,6 +640,47 @@ TY_TEST_M22_HARD_6.bat
 - Test 06 hook `force_post_project_selection_screen_not_found` activates only after project selection + Next from Projects-to-export.
 - Shared helpers in `export_wizard_common.py` (M22+ only; M03–M21 frozen).
 
+## Phase 22 — M23
+
+**Command:**
+
+```bat
+python 04_modules\m23_discover_template_screen_discovery_only.py --project "Talison 1275"
+```
+
+**Batch test:**
+
+```bat
+TY_TEST_M23_DISCOVER_TEMPLATE_SCREEN.bat
+TY_TEST_M23_HARD_6.bat
+```
+
+**Output:**
+
+`06_output\runs\<run_id>\m23_discover_template_screen_discovery_only\`
+
+**Behaviour:** Template screen discovery only. Spreadsheet → Export Type → Activities → Projects-to-export → select 001 Talison 1275 → Next → Template screen → read-only template evidence → cancel safely. Does not press Finish, Browse, modify/add/delete template, type path, or create export files.
+
+**Status:** STABLE / FROZEN — simple test `20260630_062302`, hard test `20260630_112128` (6/6). Do not modify unless a later module exposes a real shared bug.
+
+**Hard test batch:**
+
+```bat
+TY_TEST_M23_HARD_6.bat
+```
+
+**Notes:**
+
+- Valid PASS statuses: `PASS_TEMPLATE_SCREEN_DISCOVERY`, `PASS_TEMPLATE_SCREEN_DISCOVERY_PARTIAL`.
+- Next pressed exactly 3 times on discovery paths; wizard closed via Cancel.
+- No Finish pressed; no export files created; no Browse/path/template edit.
+- Hard matrix uses `ensure_clean_p6_for_m23_hard()` — M22 restore chain + neutral mouse inside P6 before each test.
+- Hard matrix skips redundant restore when precheck already restored (`skip_project_restore=True`).
+- Test 04 closes project via M05; expects `FAIL_PROJECT_NOT_OPEN`; post-test restore.
+- Test 05 hook `force_project_row_not_found` activates only after Projects-to-export screen reached.
+- Test 06 hook `force_template_screen_not_found` activates only after project selection + Next from Projects-to-export (M23 template stage).
+- Shared helpers in `export_wizard_common.py` (M23+ only; M03–M22 frozen).
+
 ## Safety (all modules)
 
 - P6-window crop OCR only — never full desktop

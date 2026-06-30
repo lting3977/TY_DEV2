@@ -4883,6 +4883,221 @@ def ensure_clean_p6_for_m22_hard(project_name: str, run_id: str) -> Dict[str, An
     return result
 
 
+# --- M23: Template screen discovery (M22-proven wizard path) ---
+
+M23_MAX_RUN_SEC = 240
+
+M23_TEMPLATE_EVIDENCE_MARKERS = M20_POST_TEMPLATE_SCREEN_WORDS + ("spreadsheet",)
+
+M23_TEMPLATE_UI_LABELS = frozenset(
+    {
+        "select template",
+        "template",
+        "modify template",
+        "add",
+        "delete",
+        "columns",
+        "next",
+        "back",
+        "cancel",
+        "finish",
+        "spreadsheet",
+        "browse",
+        "ok",
+    }
+)
+
+
+def m23_extract_template_screen_evidence(
+    entries: List[Dict[str, Any]],
+    min_confidence: float,
+    blob: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read-only template screen evidence from wizard OCR (no clicks)."""
+    blob = blob if blob is not None else collect_text_blob(entries, min_confidence)
+    norm = normalize_text(blob)
+    evidence_words = collect_post_activities_marker_words(blob, M23_TEMPLATE_EVIDENCE_MARKERS)
+    exact_labels: set = set()
+    threshold = min(min_confidence, 0.45)
+    for entry in entries:
+        if entry.get("confidence", 0) < threshold:
+            continue
+        text = (entry.get("normalized") or "").strip()
+        if text:
+            exact_labels.add(text)
+
+    modify_detected = "modify template" in norm or "modify template" in exact_labels
+    add_detected = "add" in exact_labels
+    delete_detected = "delete" in exact_labels
+    finish_detected = "finish" in exact_labels
+
+    template_names: List[str] = []
+    for entry in entries:
+        if entry.get("confidence", 0) < threshold:
+            continue
+        text = (entry.get("text") or entry.get("normalized") or "").strip()
+        norm_entry = normalize_text(text)
+        if not text or len(norm_entry) < 4:
+            continue
+        if norm_entry in M23_TEMPLATE_UI_LABELS:
+            continue
+        if norm_entry.isdigit():
+            continue
+        if any(skip in norm_entry for skip in ("export", "wizard", "microsoft", "primavera")):
+            continue
+        if text not in template_names and len(template_names) < 12:
+            template_names.append(text)
+
+    template_detected = (
+        template_screen_detected(blob)
+        or "select template" in norm
+        or (modify_detected and ("template" in norm or "columns" in norm))
+        or (len(evidence_words) >= 3 and "template" in evidence_words)
+    )
+    partial = (
+        not template_detected
+        and wizard_chrome_visible(entries, min_confidence)
+        and len(evidence_words) >= 2
+    )
+
+    return {
+        "template_screen_detected": template_detected,
+        "template_screen_partial": partial and not template_detected,
+        "template_evidence_words": sorted(set(evidence_words)),
+        "template_names_detected": template_names,
+        "modify_template_button_detected": modify_detected,
+        "add_button_detected": add_detected,
+        "delete_button_detected": delete_detected,
+        "finish_button_detected": finish_detected,
+        "raw_ocr_text": blob[:4000],
+        "exact_button_labels": sorted(exact_labels),
+    }
+
+
+def m23_build_template_hook_payload(ctx: Dict[str, Any], evidence: ExportWizardEvidence, tmpl: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "spreadsheet_selected": bool(ctx.get("spreadsheet_selected")),
+        "spreadsheet_detected": bool(ctx.get("spreadsheet_detected")),
+        "export_type_screen_detected": bool(ctx.get("export_type_screen_ok")),
+        "activities_selected": bool(ctx.get("activities_selected")),
+        "projects_to_export_screen_detected": bool(ctx.get("projects_to_export_screen_detected")),
+        "project_001_talison_detected": bool(ctx.get("project_001_talison_detected")),
+        "project_row_detected": bool(ctx.get("project_row_detected")),
+        "project_row_selected": bool(ctx.get("project_row_selected")),
+        "project_selection_attempted": bool(ctx.get("project_selection_attempted")),
+        "next_from_projects_pressed": bool(ctx.get("project_selection_next_clicked")),
+        "template_screen_detected": bool(tmpl.get("template_screen_detected")),
+        "hook_applied_at_expected_stage": True,
+        "finish_pressed": finish_pressed_in_steps(evidence.steps),
+        "export_file_created": False,
+        "next_pressed_count_total": count_next_presses(evidence.steps),
+        "template_evidence_words": list(tmpl.get("template_evidence_words", [])),
+    }
+
+
+def m23_controlled_wizard_to_template_screen(
+    evidence: ExportWizardEvidence,
+    p6_keyword: str,
+    p6_rect: P6Rect,
+    config: Dict[str, Any],
+    screen_rule: Dict[str, Any],
+    min_confidence: float,
+    project_name: str = "",
+    *,
+    force_project_row_not_found: bool = False,
+    force_template_screen_not_found: bool = False,
+) -> Tuple[P6Rect, Dict[str, Any], Optional[Dict[str, Any]]]:
+    """M23: M22 wizard path to Template screen + read-only template evidence."""
+    p6_rect, ctx, err = m22_controlled_wizard_to_post_project_selection_next(
+        evidence,
+        p6_keyword,
+        p6_rect,
+        config,
+        screen_rule,
+        min_confidence,
+        project_name,
+        force_project_row_not_found=force_project_row_not_found,
+        force_post_project_selection_screen_not_found=False,
+        suppress_post_screen_failure_return=force_template_screen_not_found,
+    )
+    if err:
+        return p6_rect, ctx, err
+
+    entries = ctx.get("post_project_selection_entries") or []
+    blob = ctx.get("post_project_selection_blob") or collect_text_blob(entries, min_confidence)
+    tmpl = m23_extract_template_screen_evidence(entries, min_confidence, blob)
+    ctx["template_evidence"] = tmpl
+    ctx["template_evidence_words"] = tmpl["template_evidence_words"]
+    ctx["template_names_detected"] = tmpl["template_names_detected"]
+    ctx["modify_template_button_detected"] = tmpl["modify_template_button_detected"]
+    ctx["add_button_detected"] = tmpl["add_button_detected"]
+    ctx["delete_button_detected"] = tmpl["delete_button_detected"]
+    ctx["template_screen_detected"] = tmpl["template_screen_detected"]
+
+    save_discovery(
+        evidence,
+        "template_screen_evidence.json",
+        {
+            **tmpl,
+            "post_project_selection_screen_type": ctx.get("post_project_selection_screen_type", ""),
+            "project_row_text": ctx.get("project_row_text", ""),
+            "project_row_selected": bool(ctx.get("project_row_selected")),
+            "next_pressed_count_total": count_next_presses(evidence.steps),
+            "finish_pressed": finish_pressed_in_steps(evidence.steps),
+        },
+    )
+
+    if force_template_screen_not_found:
+        stage_reached = all(
+            ctx.get(k)
+            for k in (
+                "spreadsheet_selected",
+                "activities_selected",
+                "projects_to_export_screen_detected",
+                "project_selection_attempted",
+                "project_selection_next_clicked",
+            )
+        ) and bool(ctx.get("export_type_screen_ok") or ctx.get("project_row_detected"))
+        if stage_reached:
+            evidence.steps.append("Hook: force_template_screen_not_found after Template screen stage")
+            hook_payload = m23_build_template_hook_payload(ctx, evidence, tmpl)
+            hook_payload["hook_applied_after_template_screen"] = True
+            hook_payload["hook_applied_at_expected_stage"] = True
+            hook_payload["original_template_screen_detected"] = bool(tmpl.get("template_screen_detected"))
+            hook_payload["forced_condition"] = "template_screen_not_found"
+            if not hook_payload.get("project_row_detected"):
+                hook_payload["project_row_detected"] = bool(ctx.get("project_row_detected"))
+            if not hook_payload.get("next_from_projects_pressed"):
+                hook_payload["next_from_projects_pressed"] = bool(ctx.get("project_selection_next_clicked"))
+            ctx["forced_hook_activation"] = hook_payload
+            save_discovery(evidence, "forced_hook_activation.json", hook_payload)
+            return p6_rect, ctx, {
+                "status": "FAIL_TEMPLATE_SCREEN_NOT_FOUND",
+                "reason": "Hook: force_template_screen_not_found",
+            }
+
+    post_type = ctx.get("post_project_selection_screen_type", "unknown")
+    if post_type == "projects_validation_popup" or ctx.get("validation_popup_detected_after_project_selection"):
+        return p6_rect, ctx, {
+            "status": "FAIL_PROJECT_SELECTION_NOT_CONFIRMED",
+            "reason": "Validation popup after project selection Next",
+        }
+
+    if not tmpl["template_screen_detected"] and not tmpl.get("template_screen_partial"):
+        if post_type not in ("template", "generic_wizard"):
+            return p6_rect, ctx, {
+                "status": "FAIL_TEMPLATE_SCREEN_NOT_FOUND",
+                "reason": "Template screen not confirmed after project selection Next",
+            }
+
+    return p6_rect, ctx, None
+
+
+def ensure_clean_p6_for_m23_hard(project_name: str, run_id: str) -> Dict[str, Any]:
+    """M23 hard-test precondition: M22 restore chain + neutral mouse inside P6."""
+    return ensure_clean_p6_for_m22_hard(project_name, run_id)
+
+
 M22_PROJECT_ROW_SKIP = frozenset(
     {
         "next",
@@ -5284,6 +5499,7 @@ def m22_controlled_wizard_to_post_project_selection_next(
     force_skip_project_row_select: bool = False,
     force_project_row_not_found: bool = False,
     force_post_project_selection_screen_not_found: bool = False,
+    suppress_post_screen_failure_return: bool = False,
 ) -> Tuple[P6Rect, Dict[str, Any], Optional[Dict[str, Any]]]:
     """M22: Spreadsheet -> Export Type -> Activities -> Projects-to-export -> select row -> Next."""
     p6_rect, ctx, err = m20_controlled_wizard_to_post_activities(
@@ -5654,6 +5870,8 @@ def m22_controlled_wizard_to_post_project_selection_next(
             "reason": post_class.get("reason", "Project selection not confirmed"),
         }
     if post_class["status"] == "FAIL_POST_PROJECT_SELECTION_SCREEN_NOT_FOUND":
+        if suppress_post_screen_failure_return:
+            return p6_rect, ctx, None
         return p6_rect, ctx, {
             "status": "FAIL_POST_PROJECT_SELECTION_SCREEN_NOT_FOUND",
             "reason": post_class.get("reason", "Post-project-selection screen not found"),

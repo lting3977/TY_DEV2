@@ -7,10 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-PASS_TARGET_MIN = 5
-PASS_DISCOVERY = frozenset(
-    {"PASS_POST_TEMPLATE_DISCOVERY", "PASS_POST_TEMPLATE_DISCOVERY_PARTIAL"}
-)
+PASS_TARGET_MIN = 6
 
 
 def write_hard_summary(
@@ -27,6 +24,11 @@ def write_hard_summary(
     unsafe = sum(1 for r in results if r.get("status") == "UNSAFE_ACTION")
     dialog_open = sum(1 for r in results if r.get("status") == "DIALOG_LEFT_OPEN")
     fullscreen = sum(1 for r in results if r.get("status") == "FULL_SCREEN_OCR")
+    pyautogui_failsafe = sum(
+        1
+        for r in results
+        if r.get("status") == "SETUP_FAILURE_PYAUTOGUI_FAILSAFE" or r.get("pyautogui_failsafe")
+    )
     scored = sum(1 for r in results if int(r.get("score", 0)) == 1)
 
     stable = (
@@ -38,11 +40,14 @@ def write_hard_summary(
         and unsafe == 0
         and dialog_open == 0
         and fullscreen == 0
+        and pyautogui_failsafe == 0
     )
 
     problems: List[str] = []
     if crashes:
         problems.append(f"{crashes} crash(es)")
+    if pyautogui_failsafe:
+        problems.append(f"{pyautogui_failsafe} PyAutoGUI fail-safe case(s)")
     if false_pass:
         problems.append(f"{false_pass} false PASS case(s)")
     if export_created:
@@ -53,8 +58,10 @@ def write_hard_summary(
         problems.append("None significant")
 
     fixes: List[str] = []
-    if export_created or finish_pressed or unsafe:
-        fixes.append("Audit M23 post-template discovery close path")
+    if pyautogui_failsafe:
+        fixes.append("Keep mouse away from screen corners during hard matrix runs")
+    if export_created or unsafe:
+        fixes.append("Audit M23 template-screen path and unsafe-action guards")
     if false_pass:
         fixes.append("Tighten M23 hard-test scoring gates")
     if not fixes:
@@ -65,13 +72,12 @@ def write_hard_summary(
         fixes.append("Re-run hard matrix after P6 layout changes")
 
     decision = "M23 STABLE" if stable else "M23 NEEDS FIX"
-    next_rec = "READY FOR NEXT MODULE" if stable else "FIX M23 AGAIN"
+    next_rec = "READY FOR M24" if stable else "M23 NEEDS FIX"
 
-    post_words_union: List[str] = []
-    for r in results:
-        for w in r.get("post_template_evidence_words", []) or []:
-            if w not in post_words_union:
-                post_words_union.append(w)
+    pass_full = sum(1 for r in results if r.get("m23_status") == "PASS_TEMPLATE_SCREEN_DISCOVERY")
+    pass_partial = sum(
+        1 for r in results if r.get("m23_status") == "PASS_TEMPLATE_SCREEN_DISCOVERY_PARTIAL"
+    )
 
     summary = {
         "run_id": run_id,
@@ -82,17 +88,21 @@ def write_hard_summary(
         "failed_unscored": len(results) - scored,
         "crashes": crashes,
         "false_pass_cases": false_pass,
+        "pyautogui_failsafe_cases": pyautogui_failsafe,
         "export_file_created_cases": export_created,
         "finish_pressed_cases": finish_pressed,
         "unsafe_actions": unsafe,
+        "dialog_left_open_cases": dialog_open,
         "final_score": total_score,
-        "max_score": len(results),
+        "max_score": len(results) if results else 6,
         "percentage": round(100.0 * total_score / len(results), 1) if results else 0,
         "decision": decision,
         "next_recommendation": next_rec,
-        "post_template_evidence": {
-            "post_template_screen_detected_count": sum(1 for r in results if r.get("post_template_screen_detected")),
-            "post_template_evidence_words": post_words_union,
+        "discovery_evidence": {
+            "pass_template_screen_discovery_count": pass_full,
+            "pass_template_screen_discovery_partial_count": pass_partial,
+            "project_row_selected_count": sum(1 for r in results if r.get("project_row_selected")),
+            "template_screen_detected_count": sum(1 for r in results if r.get("template_screen_detected")),
             "export_dialog_closed_count": sum(1 for r in results if r.get("export_dialog_closed")),
         },
         "per_test_results": results,
@@ -108,6 +118,7 @@ def write_hard_summary(
         f"- Run ID: {run_id}",
         f"- Project: {project}",
         f"- Final score: {total_score} / {len(results)}",
+        f"- PyAutoGUI fail-safe cases: {pyautogui_failsafe}",
         f"- Decision: {decision}",
         "",
         "## Per-test result",

@@ -11,6 +11,9 @@ env/
 06_output/
 logs/
 *.log
+*.sqlite
+*.db
+*.db3
 
 # Screenshots / OCR / evidence
 screenshots/
